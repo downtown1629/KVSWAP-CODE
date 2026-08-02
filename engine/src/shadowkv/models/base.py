@@ -185,7 +185,7 @@ class LLM:
         else:
             raise ValueError(f"Invalid attention mode {self.attn_mode}")
 
-        hidden_states = hidden_states.reshape(bsz, q_len, self.hidden_size)
+        hidden_states = hidden_states.reshape(bsz, q_len, self.num_heads * self.head_dim)
         
         if bsz*q_len > 64*1024: # [bsz, seq, 128]
             output = torch.empty_like(hidden_states)
