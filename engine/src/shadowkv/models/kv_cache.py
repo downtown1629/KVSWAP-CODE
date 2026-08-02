@@ -40,7 +40,7 @@ class KV_Cache:
             batch_size,
             config.num_key_value_heads,
             max_length,
-            config.hidden_size // config.num_attention_heads,
+            getattr(config, 'head_dim', config.hidden_size // config.num_attention_heads),
             device='cpu',
             dtype=self.dtype
         )
@@ -50,7 +50,7 @@ class KV_Cache:
             batch_size,
             config.num_key_value_heads,
             max_length,
-            config.hidden_size // config.num_attention_heads,
+            getattr(config, 'head_dim', config.hidden_size // config.num_attention_heads),
             device='cpu',
             dtype=self.dtype
         )
@@ -125,7 +125,7 @@ class ShadowKVCache:
         self.device = device
         self.dtype = dtype
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.head_dim = getattr(config, 'head_dim', config.hidden_size // config.num_attention_heads)
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
 
@@ -151,7 +151,7 @@ class ShadowKVCache:
             batch_size,
             config.num_key_value_heads,
             self.max_length,
-            self.config.hidden_size // self.config.num_attention_heads,
+            self.head_dim,
             device=self.device,
             dtype=self.dtype
         )
@@ -161,7 +161,7 @@ class ShadowKVCache:
             batch_size,
             config.num_key_value_heads,
             self.sparse_budget + 4096,
-            self.config.hidden_size // self.config.num_attention_heads,
+            self.head_dim,
             device=self.device,
             dtype=self.dtype
         )
@@ -171,7 +171,7 @@ class ShadowKVCache:
             batch_size,
             config.num_key_value_heads,
             self.sparse_budget + 4096,
-            self.config.hidden_size // self.config.num_attention_heads,
+            self.head_dim,
             device=self.device,
             dtype=self.dtype
         )
@@ -391,7 +391,7 @@ class ShadowKVCache_CPU_DISK:
         self.device = device
         self.dtype = dtype
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.head_dim = getattr(config, 'head_dim', config.hidden_size // config.num_attention_heads)
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
 
@@ -417,10 +417,10 @@ class ShadowKVCache_CPU_DISK:
                 batch_size,
                 config.num_key_value_heads,
                 self.max_length // self.chunk_size,
-                self.config.hidden_size // self.config.num_attention_heads * self.chunk_size,
+                self.head_dim * self.chunk_size,
                 dtype=self.dtype,
                 budget_chunk=self.sparse_budget // self.chunk_size,
-                head_dim=self.config.hidden_size // self.config.num_attention_heads,
+                head_dim=self.head_dim,
                 logger=self.logger
             )
         else:
@@ -429,7 +429,7 @@ class ShadowKVCache_CPU_DISK:
                 batch_size,
                 config.num_key_value_heads,
                 self.max_length // self.chunk_size,
-                self.config.hidden_size // self.config.num_attention_heads * self.chunk_size,
+                self.head_dim * self.chunk_size,
                 device='cpu',
                 dtype=self.dtype,
                 pin_memory=True
@@ -440,7 +440,7 @@ class ShadowKVCache_CPU_DISK:
             batch_size,
             config.num_key_value_heads,
             self.sparse_budget + 128 + (self.outlier_chunk+self.local_chunk)*self.chunk_size,
-            self.config.hidden_size // self.config.num_attention_heads,
+            self.head_dim,
             device=self.device,
             dtype=self.dtype
         )
@@ -450,7 +450,7 @@ class ShadowKVCache_CPU_DISK:
             batch_size,
             config.num_key_value_heads,
             self.sparse_budget + 128 + (self.outlier_chunk+self.local_chunk)*self.chunk_size,
-            self.config.hidden_size // self.config.num_attention_heads,
+            self.head_dim,
             device=self.device,
             dtype=self.dtype
         )
