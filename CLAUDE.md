@@ -38,11 +38,29 @@ that `engine/`'s scripts are written for. Concretely:
   Nano, **NVMe only**, small models (**Qwen3-0.6B, Qwen3-1.7B**), context length 16K, batch 1–8 — use
   that as the realistic reference point, not the AGX Orin config in the READMEs.
 - `engine/scripts/*_nano.sh` (`setup_nano.sh`, `download_models_nano.sh`, `prepare_adapter_nano.sh`,
-  `eval_nano.sh`, sharing helpers in `nano_common.sh`) are NVMe-only, Qwen3-0.6B-by-default
-  counterparts to `setup.sh`/`download_models.sh`/`eval.sh`, written for exactly this machine — use
-  these instead of patching the AGX-only originals. **See `engine/nano.md`** for the full writeup:
-  run order, what each script changes relative to its AGX Orin counterpart, and known gaps to verify
-  before trusting throughput numbers (none of this has been run on real Orin Nano hardware yet).
+  `eval_nano.sh`, `run_vllm_nano.sh`, `run_shadowkv_nano.sh`, sharing helpers in `nano_common.sh`) are
+  NVMe-only, Qwen3-0.6B-by-default counterparts to `setup.sh`/`download_models.sh`/`eval.sh`/
+  `run_vllm.sh`/ShadowKV's `run_shadowkv.sh`, written for exactly this machine — use these instead of
+  patching the AGX-only originals. **See `engine/nano.md`** for the full writeup: run order and what
+  each script changes relative to its AGX Orin counterpart (note: `nano.md`'s "not run on real
+  hardware yet" caveat is now stale — these scripts have since been run on this device, reproducing
+  paper Table 5's flexgen/InfiniGen\*/KVSwap/ShadowKV/vLLM baselines for Qwen3-0.6B).
+- `eval_nano.sh` additionally has `infinigen_ru`/`infinigen_ru_gp` modes beyond the original
+  `flexgen`/`infinigen`/`kvswap` — these reproduce the paper's InfiniGen\*/+ru/+ru+gp ablation chain
+  (§4.2) by adding KVSwap's reuse buffer and grouped I/O to InfiniGen\*'s predictor one at a time,
+  using the same `--reuse_budget`/`--token_group` flags `kvswap` mode uses (both are generic to
+  `main.py`, not KVSwap-specific).
+- `run_vllm.py`'s `gpu_memory_utilization`/`max_model_len` are env-overridable
+  (`VLLM_GPU_MEM_UTIL`/`VLLM_MAX_MODEL_LEN`, read by `run_vllm_nano.sh`) since the AGX defaults
+  (0.85/32768) fail to start on 8 GB.
+- `eval_nano.sh` runs now also produce a `<run>.jtop.csv` + `<run>.diskio.csv` pair per run
+  (`scripts/jtop_logger.py`: CPU/GPU/EMC/RAM/power via jetson-stats and disk IOPS/throughput/%util
+  via `/proc/diskstats`, both at 1 Hz from one process). `scripts/analyze_nano_results.py` parses
+  these plus the engine/ShadowKV/vLLM logs into one throughput + resource-usage comparison.
+- `data/model_weights/local_adapters/` (the Nano track's `ADAPTER_DIR`, separate from the
+  Git-LFS-managed `engine/data/adapters/`) is now populated for Qwen3-0.6B (KVSwap low-rank ratios
+  1.0/0.25 + InfiniGen\* skew ratio 0.125) and Qwen3-1.7B (KVSwap low-rank ratios 1.0/0.25),
+  committed as plain binaries like `engine/data/adapters/`.
 
 ## Setup & commands
 
