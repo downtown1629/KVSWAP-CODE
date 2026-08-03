@@ -1075,13 +1075,13 @@ class DiskTensor():
 		def write_(ind_g, data_g, g):
 			tid = threading.get_native_id()
 			os.sched_setaffinity(tid, {g})
-			if prefill:
+			if prefill or type(data_g) == tuple:
 				for b in range(data_g[0].shape[0]):
-					self.disk_interface.write(ind_g, (data_g[0][b], data_g[1][b]), fd_id=g, diskio_id=g, 
+					self.disk_interface.write(ind_g, (data_g[0][b], data_g[1][b]), fd_id=g, diskio_id=g,
 											prefill=prefill, prefill_mode=prefill_mode, batch_i=b)
 			else:
 				for b in range(data_g.shape[0]):
-					self.disk_interface.write(ind_g, data_g[b], fd_id=g, diskio_id=g, 
+					self.disk_interface.write(ind_g, data_g[b], fd_id=g, diskio_id=g,
 											prefill=prefill, prefill_mode=prefill_mode, batch_i=b)
 				# self.disk_interface.write(ind_g, data_g, fd_id=g, diskio_id=g, 
 				# 							prefill=prefill, prefill_mode=prefill_mode)

@@ -125,10 +125,10 @@ if __name__ == "__main__":
 
     llm = LLM(
         model=model,
-        max_model_len=32768,
+        max_model_len=int(os.environ.get('VLLM_MAX_MODEL_LEN', 32768)),
         max_num_batched_tokens=8192,
         max_num_seqs=16,
-        gpu_memory_utilization=0.85,
+        gpu_memory_utilization=float(os.environ.get('VLLM_GPU_MEM_UTIL', 0.85)),
         # enforce_eager=True,
         enforce_eager=False,
         swap_space=0
