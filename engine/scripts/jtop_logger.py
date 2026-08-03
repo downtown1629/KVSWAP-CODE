@@ -4,18 +4,35 @@
 Must run under jetson-stats' own venv (it ships jtop as an importable module
 there, not into the system/engine Python): /home/jetson/.local/share/jtop/bin/python
 
-Two sampling loops share one process so eval_nano.sh only has to start/stop
+Three sampling loops share one process so eval_nano.sh only has to start/stop
 one PID per run:
-  - jtop loop: CPU/GPU/EMC/RAM/SWAP/power, via jetson-stats.
+  - jtop loop: CPU/GPU/RAM/SWAP/power, via jetson-stats. These fields were
+    cross-checked line-by-line against `sudo tegrastats` output and match.
   - diskio loop: per-device read/write IOPS, throughput, queue depth and
     %util, read straight from /proc/diskstats (the same source `iostat -x`
     uses) since jtop's own API only exposes disk *capacity*, not I/O.
+  - emc loop: EMC (memory controller) bandwidth %, via `sudo tegrastats`
+    instead of jtop. jtop's own `EMC` stat is wrong on this board — its
+    `read_emc()` (jtop/core/memory.py) does
+    `utilization // emc['cur']` on the raw
+    /sys/kernel/debug/bpmp/debug/actmon/mc_all_avg_activity counter, which
+    floors to 0 for any realistic load (confirmed: jtop reports 0 in every
+    sample while `sudo tegrastats`/Jetson Power GUI show a real, varying
+    EMC_FREQ% for the same load). The correct conversion isn't a simple
+    `*100` fix either: on Orin/T234 this counter is produced by BPMP
+    firmware (closed-source, not in NVIDIA's public L4T kernel source —
+    confirmed by checking the R36.5 kernel_src.tbz2, where
+    drivers/firmware/tegra/bpmp-debugfs.c is a generic passthrough with no
+    activity-counter math at all), so there's no way to reimplement the
+    conversion correctly outside of BPMP. tegrastats already computes this
+    part correctly, so we shell out to it (needs `sudo`; this device has
+    passwordless sudo configured) rather than guess at the formula.
 
-Both run at 1.0s. That's not a diskio limitation — /proc/diskstats has no
-lower bound — but jtop's *client* does: intervals below 1.0s were tried and
-found unreliable on this jetson-stats version (7.1.5), delivering one sample
-then stalling. 1.0s is the floor that actually works, so both loops share it
-for directly time-aligned rows.
+All three run at 1.0s. That's not a diskio/tegrastats limitation — neither
+has a lower bound — but jtop's *client* does: intervals below 1.0s were
+tried and found unreliable on this jetson-stats version, delivering one
+sample then stalling. 1.0s is the floor that actually works, so all loops
+share it for directly time-aligned rows.
 
 Usage: jtop_logger.py <jtop_csv> <diskio_csv> <disk_device> [interval_seconds]
   disk_device: as it appears in /proc/diskstats, e.g. nvme0n1p1 (matches
@@ -23,12 +40,16 @@ Usage: jtop_logger.py <jtop_csv> <diskio_csv> <disk_device> [interval_seconds]
 Runs until killed (SIGTERM/SIGINT), flushing each row as it's written.
 """
 import csv
+import re
 import signal
+import subprocess
 import sys
 import threading
 import time
 
 from jtop import jtop
+
+_EMC_RE = re.compile(r"EMC_FREQ (\d+)%@(\d+)")
 
 JTOP_FIELDS = [
     "time",
@@ -46,10 +67,47 @@ DISKIO_FIELDS = [
 ]
 
 _stop = threading.Event()
+_emc_lock = threading.Lock()
+_latest_emc_pct = None
 
 
 def _handle_stop(_signum, _frame):
     _stop.set()
+
+
+def emc_loop(interval):
+    """Sample EMC bandwidth % from `sudo tegrastats`, since jtop's own value
+    is wrong on this board (see module docstring). Updates the module-level
+    _latest_emc_pct; jtop_loop reads it when writing each row."""
+    global _latest_emc_pct
+    try:
+        proc = subprocess.Popen(
+            ["sudo", "tegrastats", "--interval", str(int(interval * 1000))],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1,
+        )
+    except OSError as e:
+        print(f"[emc] couldn't start 'sudo tegrastats': {e} — "
+              "EMC%% logging disabled for this run", file=sys.stderr)
+        return
+
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            if _stop.is_set():
+                break
+            m = _EMC_RE.search(line)
+            if m:
+                with _emc_lock:
+                    _latest_emc_pct = float(m.group(1))
+    finally:
+        if proc.poll() is None:
+            # proc runs as root (via sudo); a plain kill from this
+            # unprivileged process can't touch it.
+            subprocess.run(["sudo", "kill", "-TERM", str(proc.pid)], check=False)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                subprocess.run(["sudo", "kill", "-KILL", str(proc.pid)], check=False)
 
 
 def _read_diskstat(device):
@@ -125,7 +183,7 @@ def jtop_loop(out_path, interval):
                 "cpu5": stats.get("CPU5"), "cpu6": stats.get("CPU6"),
                 "gpu_pct": stats.get("GPU"),
                 "gpu_freq_khz": gpu.get("freq", {}).get("cur"),
-                "emc_pct": stats.get("EMC"),
+                "emc_pct": _latest_emc_pct,  # from tegrastats, not jtop (see docstring)
                 "emc_freq_khz": mem.get("EMC", {}).get("cur"),
                 "ram_used_kb": mem.get("RAM", {}).get("used"),
                 "ram_free_kb": mem.get("RAM", {}).get("free"),
@@ -155,11 +213,14 @@ def main():
     signal.signal(signal.SIGTERM, _handle_stop)
     signal.signal(signal.SIGINT, _handle_stop)
 
-    t = threading.Thread(target=diskio_loop, args=(diskio_csv, device, interval),
-                         daemon=True)
-    t.start()
+    t_diskio = threading.Thread(target=diskio_loop, args=(diskio_csv, device, interval),
+                                 daemon=True)
+    t_emc = threading.Thread(target=emc_loop, args=(interval,), daemon=True)
+    t_diskio.start()
+    t_emc.start()
     jtop_loop(jtop_csv, interval)
-    t.join(timeout=interval + 2)
+    t_diskio.join(timeout=interval + 2)
+    t_emc.join(timeout=interval + 2)
 
 
 if __name__ == "__main__":

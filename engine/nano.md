@@ -78,10 +78,11 @@ disk-offloading modes — see "Known gaps" below).
   AGX sweep scripts (`tab-4.sh`/`fig-10.sh`) as a starting point, since the paper doesn't publish an
   Orin Nano/Qwen3-0.6B-specific setting.
 - **`scripts/jtop_logger.py`** — must run under jetson-stats' own venv, not `engine/.venv` (it ships
-  `jtop` as an importable module only there). Two sampling loops in one process, both at 1Hz (jtop's
+  `jtop` as an importable module only there). Three sampling loops in one process, all at 1Hz (jtop's
   *client* is unreliable below 1.0s on this jetson-stats version — one sample then stalls): CPU/GPU/
-  EMC/RAM/SWAP/power via `jtop`, and disk read/write IOPS/throughput/queue-depth/`%util` read
-  straight from `/proc/diskstats` (jtop's own API only exposes disk *capacity*, not I/O). Writes
+  RAM/SWAP/power via `jtop`; disk read/write IOPS/throughput/queue-depth/`%util` read straight from
+  `/proc/diskstats` (jtop's own API only exposes disk *capacity*, not I/O); and EMC bandwidth % via
+  `sudo tegrastats` (jtop's own `EMC` stat is wrong on this board — see Known gaps below). Writes
   `<run>.jtop.csv` + `<run>.diskio.csv`.
 - **`scripts/analyze_nano_results.py`** — parses `eval_nano.sh`/ShadowKV/vLLM logs plus the
   jtop+diskio CSVs into one comparison: decode-only throughput per method/batch, per-layer disk cost
@@ -176,9 +177,24 @@ running something heavy:
   estimates for Qwen3-0.6B/1.7B at batch ≤ 8, context ≤ 32K — both are disk-space knobs (NVMe has
   headroom to spare), not RAM knobs, but raise them if you hit `create_kv_file`'s
   `total_bytes <= MAX_ALLOC_KV_SIZE` assertion at larger batches/contexts.
-- **jtop's own limitations on this board.** `EMC` utilization reads `0.0%` in every sample regardless
-  of actual memory-bandwidth pressure (the `EMC` *frequency* field is accurate, just not the load
-  percentage) — infer memory-bandwidth pressure from power/GPU-residency instead.
+- **jtop's own `EMC` field is wrong on this board — `jtop_logger.py` sources EMC% from `sudo
+  tegrastats` instead.** jetson-stats' `read_emc()` (`jtop/core/memory.py`, confirmed present in both
+  7.1.5 and 7.2.0) computes `utilization // emc['cur']` on the raw
+  `/sys/kernel/debug/bpmp/debug/actmon/mc_all_avg_activity` counter with no `*100` and no unit
+  reconciliation (`utilization` is unscaled, `emc['cur']` is kHz), so it floors to `0` for any
+  realistic load — confirmed both by direct measurement (`jtop`'s `EMC` stat reads `0` in every
+  sample regardless of load) and by cross-checking against `sudo tegrastats`/Jetson Power GUI, which
+  report a real, varying `EMC_FREQ%` for the identical load. This isn't a one-line fix, either: on
+  Orin/T234 that activity counter is produced by BPMP firmware (a closed-source blob on the separate
+  Cortex-R5 co-processor), not by a Linux kernel driver — checked against NVIDIA's public R36.5
+  `kernel_src.tbz2`, where `drivers/firmware/tegra/bpmp-debugfs.c` is a generic debugfs-to-BPMP-MRQ
+  passthrough with no activity-counter math at all, so the correct conversion isn't reconstructable
+  from public source. `tegrastats` already gets this right, so `jtop_logger.py`'s `emc_loop` shells
+  out to `sudo tegrastats --interval <ms>` (this device has passwordless sudo) and parses `EMC_FREQ`
+  from it, overriding jtop's own (still-buggy) value in the `emc_pct` column; `emc_freq_khz` stays
+  sourced from jtop since that's just a direct sysfs read and was already accurate. Every other jtop
+  field used here (CPU/GPU/RAM/power) was cross-checked line-by-line against `tegrastats` and matches,
+  so only `EMC` needed this workaround.
   jetson-stats' client also can't sample faster than 1.0s reliably here; a `jtop(interval=<1.0)`
   request delivers exactly one sample and then stalls, so `jtop_logger.py` is pinned at 1.0s rather
   than something finer.
