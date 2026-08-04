@@ -35,6 +35,17 @@ fix_recursive_import()
 
 CONCAT_PROJ_WEIGHT = False
 
+
+def get_peak_rss_kb():
+	# VmHWM is kernel-tracked over the whole process lifetime, no sampling
+	# loop needed; unlike torch.cuda's stats it also covers diskio_base.py's
+	# pinned host staging buffers and the CUDA context.
+	with open("/proc/self/status") as f:
+		for line in f:
+			if line.startswith("VmHWM:"):
+				return int(line.split()[1])
+	return None
+
 @dataclasses.dataclass(frozen=True)
 class Policy:
 	gpu_batch_size: int
@@ -1756,6 +1767,17 @@ def run_flexgen(args):
 	print("+++++++++++++++++++++++++++++++++++++++++++++++++")
 	print("Latency Total: " + str(total_latency) + " Prefill: " + str(prefill_latency) + " Decode: " + str(decode_latency))
 	print(f"Throughput Total: {total_throughput:.2f} Prefill: {prefill_throughput:.2f} Decode: {decode_throughput:.2f}")
+
+	# whole-process RSS vs. torch's own allocator peak -- see
+	# KVSWAP_DISK_IO_QWEN3_0.6B.md sec.8 for why both are logged.
+	peak_rss_kb = get_peak_rss_kb()
+	peak_rss_str = f"{peak_rss_kb / 1024 / 1024:.3f}" if peak_rss_kb is not None else "n/a"
+	if gpu is not None:
+		torch_peak_alloc_gb = torch.cuda.max_memory_allocated() / 1024**3
+		torch_peak_reserved_gb = torch.cuda.max_memory_reserved() / 1024**3
+	else:
+		torch_peak_alloc_gb = torch_peak_reserved_gb = 0.0
+	print(f"Peak Memory (GB) RSS: {peak_rss_str} TorchAllocated: {torch_peak_alloc_gb:.3f} TorchReserved: {torch_peak_reserved_gb:.3f}")
 	print("=================================================")
 
 

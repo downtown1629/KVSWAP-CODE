@@ -14,6 +14,11 @@ numbers are directly comparable:
   ShadowKV "Throughput: X tokens/s"                  -> gen_len*bsz / decode_time
   vLLM run_vllm.py                                   -> 100*batch / (total-prefill)
 
+engine runs also log one "Peak Memory (GB) RSS: ... TorchAllocated: ...
+TorchReserved: ..." line (see main.py's get_peak_rss_kb()); parsed into
+peak_rss_gb/peak_torch_alloc_gb/peak_torch_reserved_gb columns in
+summary.csv, alongside jtop_summary.csv's system-wide ram_used_peak_gb.
+
 Usage:
   .venv/bin/python scripts/analyze_nano_results.py [--model Qwen3-0.6B] [--outdir RESULTS/nano]
 Writes summary.csv, jtop_summary.csv and throughput.png / resources.png to --outdir.
@@ -37,6 +42,13 @@ RE_LAT = re.compile(
 RE_SWAP = re.compile(
     r"Swap:\s*\(\d+,\),\s*avg_num:\s*([\d.]+),\s*avg_time:\s*([\d.]+) ms,"
     r"\s*avg_size:\s*([\d.]+) MB,\s*avg_bw:\s*([\d.]+) MB/s")
+# "Peak Memory (GB) RSS: 1.842 TorchAllocated: 1.401 TorchReserved: 1.520"
+# (RSS is kernel-tracked VmHWM, covers the whole process incl. pinned diskio
+# staging buffers; TorchAllocated/Reserved are torch.cuda's own allocator
+# stats, attributable to specific GPU tensors -- see main.py's
+# get_peak_rss_kb() and KVSWAP_DISK_IO_QWEN3_0.6B.md sec.8)
+RE_PEAKMEM = re.compile(
+    r"Peak Memory \(GB\) RSS:\s*([\d.]+|n/a)\s*TorchAllocated:\s*([\d.]+)\s*TorchReserved:\s*([\d.]+)")
 # engine log filename: <model>_<tag>_b<batch>_cl<ctx>.log, tag itself may contain '_'
 RE_ENGINE_NAME = re.compile(r"^(?P<model>.+?)_(?P<tag>.+)_b(?P<batch>\d+)_cl(?P<ctx>\d+)$")
 # shadowkv log filename: <prompt_len>_bsz<b>_gen<g>_chunk<c>_r<rank>.log
@@ -104,6 +116,12 @@ def parse_engine_log(path):
         # what one decode step pays in disk reads, summed over all layers
         row["swap_step_time_ms"] = sum(s[1] for s in swaps)
         row["swap_step_size_mb"] = sum(s[2] for s in swaps)
+    peakmem = RE_PEAKMEM.findall(text)
+    if peakmem:
+        rss, torch_alloc, torch_reserved = peakmem[-1]
+        row["peak_rss_gb"] = float(rss) if rss != "n/a" else None
+        row["peak_torch_alloc_gb"] = float(torch_alloc)
+        row["peak_torch_reserved_gb"] = float(torch_reserved)
     return row
 
 
