@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """Collect + plot the Orin Nano (NVMe-only, Qwen3-0.6B) Table-5-style results.
 
-Parses four differently-shaped result sources into one frame:
-  - engine runs (flexgen/infinigen/kvswap): $EVAL_LOG_DIR/$EVAL_USER/logs/nano/<model>/*.log
-  - ShadowKV:                               $EVAL_LOG_DIR/$EVAL_USER/logs/shadowkv/**/*.log
-  - vLLM:                                   $EVAL_LOG_DIR/$EVAL_USER/vllm_results/<model>_results.csv
-  - per-run jtop samples:                   <engine log path>.jtop.csv  (scripts/jtop_logger.py)
-  - per-run disk I/O samples:               <engine log path>.diskio.csv (same script, sibling file)
+scripts/eval_nano.sh now drives every baseline (flexgen/infinigen*/kvswap via
+src/main.py, plus shadowkv and vllm) from one entry point, and all of them log
+under one directory: $EVAL_LOG_DIR/$EVAL_USER/logs/nano/<model>/. Parses three
+differently-shaped result sources out of that one tree into one frame:
+  - main.py + ShadowKV runs:  $EVAL_LOG_DIR/$EVAL_USER/logs/nano/<model>/*.log
+    (same <model>_<tag>_b<batch>_cl<ctx>.log naming for both; distinguished by
+    whether <tag> starts with "shadowkv")
+  - vLLM:                     $EVAL_LOG_DIR/$EVAL_USER/logs/nano/<model>/<model>_results.csv
+  - per-run jtop samples:     <run log path>.jtop.csv  (scripts/jtop_logger.py; not
+                              written for vLLM, which sweeps every batch in one process)
+  - per-run disk I/O samples: <run log path>.diskio.csv (same script, sibling file)
 
 All four report *decode-only* tokens/sec aggregated over the batch, so the
 numbers are directly comparable:
@@ -14,9 +19,9 @@ numbers are directly comparable:
   ShadowKV "Throughput: X tokens/s"                  -> gen_len*bsz / decode_time
   vLLM run_vllm.py                                   -> 100*batch / (total-prefill)
 
-engine runs also log one "Peak Memory (GB) RSS: ... TorchAllocated: ...
-TorchReserved: ..." line (see main.py's get_peak_rss_kb()); parsed into
-peak_rss_gb/peak_torch_alloc_gb/peak_torch_reserved_gb columns in
+main.py runs (not ShadowKV/vLLM) also log one "Peak Memory (GB) RSS: ...
+TorchAllocated: ... TorchReserved: ..." line (see main.py's get_peak_rss_kb());
+parsed into peak_rss_gb/peak_torch_alloc_gb/peak_torch_reserved_gb columns in
 summary.csv, alongside jtop_summary.csv's system-wide ram_used_peak_gb.
 
 Usage:
@@ -49,14 +54,12 @@ RE_SWAP = re.compile(
 # get_peak_rss_kb() and KVSWAP_DISK_IO_QWEN3_0.6B.md sec.8)
 RE_PEAKMEM = re.compile(
     r"Peak Memory \(GB\) RSS:\s*([\d.]+|n/a)\s*TorchAllocated:\s*([\d.]+)\s*TorchReserved:\s*([\d.]+)")
-# engine log filename: <model>_<tag>_b<batch>_cl<ctx>.log, tag itself may contain '_'
+# run log filename (main.py and shadowkv both use this): <model>_<tag>_b<batch>_cl<ctx>.log,
+# tag itself may contain '_'
 RE_ENGINE_NAME = re.compile(r"^(?P<model>.+?)_(?P<tag>.+)_b(?P<batch>\d+)_cl(?P<ctx>\d+)$")
-# shadowkv log filename: <prompt_len>_bsz<b>_gen<g>_chunk<c>_r<rank>.log
-RE_SKV_NAME = re.compile(
-    r"^(?P<plen>\d+)_bsz(?P<batch>\d+)_gen(?P<gen>\d+)_chunk(?P<chunk>\d+)_r(?P<rank>\d+)$")
 RE_SKV_TPUT = re.compile(r"Throughput:\s*([\d.]+) tokens/s")
 
-# tag prefix in the engine log filename -> display name. Longest prefix wins
+# tag prefix in the run log filename -> display name. Longest prefix wins
 # (checked in this order) since eval_nano.sh's ablation trio all start with
 # "infinigen": infinigen_ru_gp / infinigen_ru / infinigen must not collapse
 # into one bucket.
@@ -66,6 +69,7 @@ METHOD_BY_TAG = [
     ("infinigen_ru", "InfiniGen*+ru"),
     ("infinigen", "InfiniGen*"),
     ("kvswap", "KVSwap"),
+    ("shadowkv", "ShadowKV"),
 ]
 ORDER = ["FlexGen", "InfiniGen*", "InfiniGen*+ru", "InfiniGen*+ru+gp", "KVSwap",
          "ShadowKV", "vLLM"]
@@ -79,12 +83,26 @@ def method_from_tag(tag):
 
 
 def parse_engine_log(path):
-    """One engine run -> dict, or None if it never reached a throughput line."""
+    """One run (main.py or shadowkv) -> dict, or None if no throughput line yet."""
     stem = os.path.basename(path)[: -len(".log")]
     m = RE_ENGINE_NAME.match(stem)
     if not m:
         return None
     text = open(path, errors="ignore").read()
+
+    if m["tag"].startswith("shadowkv"):
+        tput = RE_SKV_TPUT.findall(text)
+        if not tput:
+            return None
+        return {
+            "method": "ShadowKV",
+            "config": m["tag"],
+            "batch": int(m["batch"]),
+            "ctx": int(m["ctx"]),
+            "decode_tps": float(tput[-1]),
+            "log": path,
+        }
+
     tput = RE_TPUT.findall(text)
     if not tput:
         return None
@@ -123,25 +141,6 @@ def parse_engine_log(path):
         row["peak_torch_alloc_gb"] = float(torch_alloc)
         row["peak_torch_reserved_gb"] = float(torch_reserved)
     return row
-
-
-def parse_shadowkv_log(path):
-    stem = os.path.basename(path)[: -len(".log")]
-    m = RE_SKV_NAME.match(stem)
-    if not m:
-        return None
-    text = open(path, errors="ignore").read()
-    tput = RE_SKV_TPUT.findall(text)
-    if not tput:
-        return None
-    return {
-        "method": "ShadowKV",
-        "config": os.path.basename(os.path.dirname(os.path.dirname(path))),  # budget<N>
-        "batch": int(m["batch"]),
-        "ctx": int(m["plen"]) + int(m["gen"]),
-        "decode_tps": float(tput[-1]),
-        "log": path,
-    }
 
 
 def parse_vllm_csv(path, ctx_filter=None):
@@ -269,13 +268,8 @@ def collect(log_root, model, ctx):
         r = parse_engine_log(p)
         if r and r["ctx"] == ctx:
             rows.append(r)
-    for p in sorted(glob(os.path.join(log_root, "logs", "shadowkv", "**", "*.log"),
-                         recursive=True)):
-        r = parse_shadowkv_log(p)
-        if r and r["ctx"] == ctx:
-            rows.append(r)
     rows += parse_vllm_csv(
-        os.path.join(log_root, "vllm_results", f"{model}_results.csv"), ctx_filter=ctx)
+        os.path.join(log_root, "logs", "nano", model, f"{model}_results.csv"), ctx_filter=ctx)
     return rows
 
 

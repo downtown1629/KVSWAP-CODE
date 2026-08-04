@@ -25,9 +25,10 @@ disk-offloading modes — see "Known gaps" below).
 | Default model | Llama-3.1-8B-Instruct / Qwen3-14B | Qwen3-0.6B |
 | Power mode / clock check | hard-exits unless `nvpmodel` reports exactly `MAXN` and CPU/GPU devfreq are pinned at a hardcoded sysfs path | prints what it finds and warns instead of exiting; `eval_nano.sh` additionally runs `sudo jetson_clocks` itself before each batch (advisory — needs passwordless sudo, otherwise clocks are left as-is) |
 | Adapters | ships with the repo under `engine/data/adapters/` | ships for Qwen3-0.6B/1.7B under `$MODEL_PATH_BASE/local_adapters` (committed to the repo, see below); `prepare_adapter_nano.sh` (re)generates more |
-| vLLM baseline | `run_vllm.sh` hard-exits like `setup.sh`; `run_vllm.py` hardcodes `gpu_memory_utilization=0.85`/`max_model_len=32768` | `run_vllm_nano.sh`; both knobs are env-overridable (`VLLM_GPU_MEM_UTIL`/`VLLM_MAX_MODEL_LEN`) since the AGX defaults don't fit 8GB |
-| ShadowKV baseline | `src/shadowkv/run_shadowkv.sh` hard-exits like `setup.sh` | `run_shadowkv_nano.sh`, soft-check equivalent, same underlying `test/e2e_jetson.py` driver |
-| Resource logging | none | `eval_nano.sh` wires in `scripts/jtop_logger.py` automatically — one CPU/GPU/EMC/RAM/power/disk-I/O sample per second per run |
+| vLLM baseline | `run_vllm.sh` hard-exits like `setup.sh`; `run_vllm.py` hardcodes `gpu_memory_utilization=0.85`/`max_model_len=32768` | `eval_nano.sh vllm` mode; both knobs are env-overridable (`VLLM_GPU_MEM_UTIL`/`VLLM_MAX_MODEL_LEN`) since the AGX defaults don't fit 8GB |
+| ShadowKV baseline | `src/shadowkv/run_shadowkv.sh` hard-exits like `setup.sh` | `eval_nano.sh shadowkv` mode, soft-check equivalent, same underlying `test/e2e_jetson.py` driver |
+| Resource logging | none | `eval_nano.sh` wires in `scripts/jtop_logger.py` automatically — one CPU/GPU/EMC/RAM/power/disk-I/O sample per second per run (all modes except `vllm`, which sweeps every batch in one process) |
+| Result logs | split per baseline (own dirs for engine/ShadowKV/vLLM) | one tree for every mode: `$EVAL_LOG_DIR/$EVAL_USER/logs/nano/<model>/` |
 
 ## Files
 
@@ -51,8 +52,12 @@ disk-offloading modes — see "Known gaps" below).
   here as plain binaries, same as `engine/data/adapters/`'s own `.pt` files. Currently populated for
   Qwen3-0.6B (KVSwap low-rank ratios 1.0/0.25 + InfiniGen* skew ratio 0.125) and Qwen3-1.7B (KVSwap
   low-rank ratios 1.0/0.25).
-- **`scripts/eval_nano.sh`** — NVMe-only driver for `src/main.py`, with five modes:
-  - `flexgen` — full-KV baseline, no prediction, **no adapter required**. Run this first.
+- **`scripts/eval_nano.sh`** — NVMe-only driver for every baseline evaluated on Orin Nano, with seven
+  modes. There used to be three separate scripts here (this one, `run_vllm_nano.sh`,
+  `run_shadowkv_nano.sh`) each writing to their own result tree; those two are gone, folded into this
+  one, and every mode now logs under the same directory (see "Result logs" below).
+  - `flexgen` — full-KV baseline via `src/main.py`, no prediction, **no adapter required**. Run this
+    first.
   - `infinigen` — InfiniGen*-style index-selecting predictor. Needs the skew adapter
     (`prepare_adapter_nano.sh --with-infinigen`).
   - `infinigen_ru` / `infinigen_ru_gp` — the same InfiniGen* predictor with KVSwap's reuse buffer
@@ -60,23 +65,26 @@ disk-offloading modes — see "Known gaps" below).
     InfiniGen*/+ru/+ru+gp ablation chain (§4.2) using the same `--reuse_budget`/`--token_group` flags
     `kvswap` mode uses (both flags are generic to `main.py`, not KVSwap-specific). Needs the same
     skew adapter as `infinigen`.
-  - `kvswap` — the actual KVSwap low-rank predictor. Needs the KVSwap adapter
+  - `kvswap` — the actual KVSwap low-rank predictor via `src/main.py`. Needs the KVSwap adapter
     (`prepare_adapter_nano.sh`, no flag needed).
+  - `shadowkv` — the ShadowKV baseline via `src/shadowkv/test/e2e_jetson.py`. Requires the ShadowKV
+    CUDA extension already built
+    (`cd src/shadowkv && MAX_JOBS=1 python setup.py build_ext --inplace` — `MAX_JOBS=1` matters on 8GB
+    unified memory, see "Known gaps"). `BUDGET`/`CHUNK_SIZE`/`RANK` env vars default to values copied
+    from the AGX sweep scripts (`tab-4.sh`/`fig-10.sh`) as a starting point, since the paper doesn't
+    publish an Orin Nano/Qwen3-0.6B-specific setting. Reads weights from `MODEL_PATH_BASE_HF`, not
+    `MODEL_PATH_BASE` (unlike the `src/main.py`-based modes above).
+  - `vllm` — the vLLM "no offload" upper bound via `src/run_vllm.py`. `VLLM_GPU_MEM_UTIL`/
+    `VLLM_MAX_MODEL_LEN` env vars fit it into 8GB (the AGX defaults of 0.85/32768 fail to start here);
+    `VLLM_MAX_MODEL_LEN` defaults to the `total_len` argument. Also reads from `MODEL_PATH_BASE_HF`,
+    and — unlike every other mode — sweeps the whole batch list in one process (to avoid reloading the
+    model per batch) and writes one CSV instead of one log per batch, so it skips the jtop/diskio
+    per-run sampling the other modes get.
 
-  Also applies `sudo jetson_clocks` before each batch (set `APPLY_JETSON_CLOCKS=0` to skip), drops
-  the page cache between batches (advisory, needs passwordless sudo), and starts/stops
-  `scripts/jtop_logger.py` around each run (see below) — override its path with `JTOP_PY` if
-  jetson-stats isn't at the default `/home/jetson/.local/share/jtop/bin/python`.
-- **`scripts/run_vllm_nano.sh`** — soft-check counterpart to `scripts/run_vllm.sh`. Set
-  `VLLM_GPU_MEM_UTIL`/`VLLM_MAX_MODEL_LEN` to fit the vLLM "no offload" baseline into 8GB (the AGX
-  defaults of 0.85/32768 fail to start here); defaults to `VLLM_MAX_MODEL_LEN` = the largest seqlen
-  being tested.
-- **`scripts/run_shadowkv_nano.sh`** — soft-check counterpart to `src/shadowkv/run_shadowkv.sh`.
-  Requires the ShadowKV CUDA extension already built
-  (`cd src/shadowkv && MAX_JOBS=1 python setup.py build_ext --inplace` — `MAX_JOBS=1` matters on 8GB
-  unified memory, see "Known gaps"). `budget`/`chunk_size`/`rank` default to values copied from the
-  AGX sweep scripts (`tab-4.sh`/`fig-10.sh`) as a starting point, since the paper doesn't publish an
-  Orin Nano/Qwen3-0.6B-specific setting.
+  For the `src/main.py`/`shadowkv` modes: also applies `sudo jetson_clocks` before each batch (set
+  `APPLY_JETSON_CLOCKS=0` to skip), drops the page cache between batches (advisory, needs passwordless
+  sudo), and starts/stops `scripts/jtop_logger.py` around each run (see below) — override its path with
+  `JTOP_PY` if jetson-stats isn't at the default `/home/jetson/.local/share/jtop/bin/python`.
 - **`scripts/jtop_logger.py`** — must run under jetson-stats' own venv, not `engine/.venv` (it ships
   `jtop` as an importable module only there). Three sampling loops in one process, all at 1Hz (jtop's
   *client* is unreliable below 1.0s on this jetson-stats version — one sample then stalls): CPU/GPU/
@@ -84,11 +92,13 @@ disk-offloading modes — see "Known gaps" below).
   `/proc/diskstats` (jtop's own API only exposes disk *capacity*, not I/O); and EMC bandwidth % via
   `sudo tegrastats` (jtop's own `EMC` stat is wrong on this board — see Known gaps below). Writes
   `<run>.jtop.csv` + `<run>.diskio.csv`.
-- **`scripts/analyze_nano_results.py`** — parses `eval_nano.sh`/ShadowKV/vLLM logs plus the
-  jtop+diskio CSVs into one comparison: decode-only throughput per method/batch, per-layer disk cost
-  from the engine's own `Swap:` log lines, prefill/decode-split resource usage, and disk-I/O ablation
-  charts. Run via `.venv/bin/python scripts/analyze_nano_results.py` (needs `pandas`/`matplotlib`,
-  already in `engine/.venv`); writes CSVs + PNGs to `RESULTS/nano/` by default.
+- **`scripts/analyze_nano_results.py`** — parses every `eval_nano.sh` mode's logs (main.py/ShadowKV
+  runs share one `.log` naming convention, vLLM writes its own CSV — all three now live in the one
+  `logs/nano/<model>/` tree) plus the jtop+diskio CSVs into one comparison: decode-only throughput per
+  method/batch, per-layer disk cost from the engine's own `Swap:` log lines, prefill/decode-split
+  resource usage, and disk-I/O ablation charts. Run via
+  `.venv/bin/python scripts/analyze_nano_results.py` (needs `pandas`/`matplotlib`, already in
+  `engine/.venv`); writes CSVs + PNGs to `RESULTS/nano/` by default.
 
 ## Usage
 
@@ -121,9 +131,9 @@ bash ./scripts/prepare_adapter_nano.sh          # add --with-infinigen for the I
 # 5. Run KVSwap itself
 bash ./scripts/eval_nano.sh kvswap
 
-# 6. Baselines outside main.py
-bash ./scripts/run_vllm_nano.sh                     # vLLM, no offloading
-bash ./scripts/run_shadowkv_nano.sh                 # ShadowKV (build its CUDA ext first, see above)
+# 6. Baselines outside main.py — same entry point, same log tree
+bash ./scripts/eval_nano.sh vllm                    # vLLM, no offloading
+bash ./scripts/eval_nano.sh shadowkv                # ShadowKV (build its CUDA ext first, see above)
 
 # 7. Once a batch of runs has completed logs, compare them:
 .venv/bin/python scripts/analyze_nano_results.py
@@ -135,12 +145,18 @@ bash ./scripts/run_shadowkv_nano.sh                 # ShadowKV (build its CUDA e
 bash ./scripts/eval_nano.sh kvswap 16384 "1 2 4 8"
 RATIO=0.25 bash ./scripts/eval_nano.sh kvswap 32768 "1 4"   # tight-budget adapter
 bash ./scripts/eval_nano.sh infinigen_ru_gp 16384 "1 2"     # InfiniGen* + reuse buffer + grouped I/O
+bash ./scripts/eval_nano.sh shadowkv 16384 "1 2 4"          # ShadowKV
+bash ./scripts/eval_nano.sh vllm 16384 "1 2 4 8"            # vLLM, no offloading
 ```
 
-Logs land under `$EVAL_LOG_DIR/$EVAL_USER/logs/nano/<model>/`, one file per `(mode, batch, context)`
-combination; reruns skip any log that already has a `Throughput Total:` line, same convention as
+Logs for every mode — including `shadowkv` and `vllm` — land under the one directory
+`$EVAL_LOG_DIR/$EVAL_USER/logs/nano/<model>/`. `src/main.py` and `shadowkv` modes write one file per
+`(mode, batch, context)` combination; reruns skip any log that already has its completion line
+(`Throughput Total:` for `src/main.py` modes, `Throughput:` for `shadowkv`), same convention as
 `scripts/eval.sh`. Each also gets a sibling `.jtop.csv` + `.diskio.csv` pair (see
-`scripts/jtop_logger.py` above) if jetson-stats is installed.
+`scripts/jtop_logger.py` above) if jetson-stats is installed. `vllm` mode is the exception: it sweeps
+every batch size in one process and writes a single `<model>_results.csv` (no jtop/diskio pair) to the
+same directory.
 
 ## Known gaps / things to verify
 

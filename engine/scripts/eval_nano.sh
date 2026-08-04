@@ -1,20 +1,32 @@
 #!/bin/bash
 set -e
-# NVMe-only, Qwen3-0.6B-by-default driver for src/main.py. Adapted from
-# scripts/eval.sh, which is written for AGX Orin (requires both eMMC and
+# NVMe-only, Qwen3-0.6B-by-default driver for all Orin Nano baselines. Adapted
+# from scripts/eval.sh, which is written for AGX Orin (requires both eMMC and
 # NVMe env vars, and hard-fails the nvpmodel/devfreq checks this device
 # hasn't been verified against — see nano_common.sh).
+#
+# Covers every baseline this repo evaluates on Orin Nano from one entry
+# point: flexgen/infinigen*/kvswap (src/main.py), shadowkv
+# (src/shadowkv/test/e2e_jetson.py) and vllm (src/run_vllm.py) all log under
+# the same directory, ${EVAL_LOG_DIR}/${EVAL_USER}/logs/nano/<model>/ — there
+# used to be three separate scripts (this one, run_vllm_nano.sh,
+# run_shadowkv_nano.sh) writing to three separate trees (logs/nano/<model>,
+# logs/shadowkv/**, vllm_results/); those two scripts are gone, folded in
+# here, and scripts/analyze_nano_results.py has been updated to read the one
+# unified tree.
 #
 # Usage:
 #   bash scripts/eval_nano.sh <mode> [total_len] ["batch_list"] [model]
 #
 #   mode:       flexgen | infinigen | infinigen_ru | infinigen_ru_gp | kvswap
+#               | shadowkv | vllm
 #               (default: kvswap)
 #   total_len:  context length incl. gen_len=100    (default: 16384 — matches
 #               PAPER.pdf Table 5's Orin Nano config, Sec 5.2.2)
 #   batch_list: quoted, space-separated batch sizes  (default: "1 2 4 8" —
 #               also matches Table 5)
-#   model:      dir name under MODEL_PATH_BASE       (default: Qwen3-0.6B)
+#   model:      dir name under MODEL_PATH_BASE / MODEL_PATH_BASE_HF
+#               (default: Qwen3-0.6B)
 #
 # `flexgen` = plain full-KV baseline (no prediction, no adapter needed) — the
 # right first smoke test. `infinigen`/`infinigen_ru`/`infinigen_ru_gp`/`kvswap`
@@ -22,20 +34,35 @@ set -e
 # none for Qwen3-0.6B). The infinigen_* trio is an ablation chain: `infinigen`
 # = InfiniGen* alone, `infinigen_ru` adds the reuse buffer, `infinigen_ru_gp`
 # additionally groups tokens (token_group>1) — see paper §4.2's
-# InfiniGen*/+ru/+gp baseline definitions.
+# InfiniGen*/+ru/+gp baseline definitions. `shadowkv` and `vllm` are the two
+# baselines that don't go through src/main.py: `shadowkv` needs the ShadowKV
+# CUDA extension already built (cd src/shadowkv && MAX_JOBS=1 python setup.py
+# build_ext --inplace); `vllm` is the "no offload, all spare memory to KV
+# cache" upper bound and reads model weights from MODEL_PATH_BASE_HF (not the
+# fp16 np-weights src/main.py's modes use), and — unlike every other mode —
+# runs the whole BATCH_LIST in one process (to avoid reloading the model per
+# batch) and writes one CSV instead of one log per batch.
+#
+# BUDGET/CHUNK_SIZE/RANK (shadowkv) and VLLM_GPU_MEM_UTIL/VLLM_MAX_MODEL_LEN
+# (vllm) are env-overridable knobs specific to those two modes — see their
+# defaults inline below.
 #
 # Examples:
 #   bash scripts/eval_nano.sh flexgen
 #   bash scripts/eval_nano.sh kvswap 16384 "1 2 4 8"
 #   RATIO=0.25 bash scripts/eval_nano.sh kvswap 32768 "1 4"   # tight-budget adapter
+#   bash scripts/eval_nano.sh shadowkv 16384 "1 2 4"
+#   bash scripts/eval_nano.sh vllm 16384 "1 2 4 8"
 #
-# Each run also gets CPU/GPU/EMC/RAM/SWAP/power and per-device disk-I/O
-# sample logs alongside its throughput log (${RUN_INFO}.jtop.csv and
-# ${RUN_INFO}.diskio.csv, both from one scripts/jtop_logger.py process) if
-# jetson-stats is installed — see JTOP_PY override below if it's not at the
-# default path. Also drops the page cache between runs (advisory, needs
-# passwordless sudo for `sysctl -w vm.drop_caches=1`) since 8GB unified
-# memory is tight enough that leftover cache from the previous batch matters.
+# Each src/main.py or shadowkv run also gets CPU/GPU/EMC/RAM/SWAP/power and
+# per-device disk-I/O sample logs alongside its throughput log
+# (${RUN_INFO}.jtop.csv and ${RUN_INFO}.diskio.csv, both from one
+# scripts/jtop_logger.py process) if jetson-stats is installed — see JTOP_PY
+# override below if it's not at the default path. (vllm's single
+# whole-sweep process isn't split into per-batch jtop logs, matching how
+# run_vllm_nano.sh never wired this up either.) Also drops the page cache
+# between runs (advisory, needs passwordless sudo) since 8GB unified memory
+# is tight enough that leftover cache from the previous batch matters.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./nano_common.sh
@@ -46,7 +73,7 @@ if [ "$(basename "$(pwd)")" != "engine" ]; then
     exit 1
 fi
 
-for v in NVME_DEV_NAME NVME_OFFLOAD_DIR MODEL_PATH_BASE EVAL_LOG_DIR EVAL_USER; do
+for v in EVAL_LOG_DIR EVAL_USER; do
     if [ -z "${!v}" ]; then
         echo "Error: $v is not set"
         exit 1
@@ -58,22 +85,67 @@ TOTAL_LEN="${2:-16384}"
 BATCH_LIST="${3:-1 2 4 8}"
 TEST_MODEL="${4:-Qwen3-0.6B}"
 
-MODEL_PATH="${MODEL_PATH_BASE}/${TEST_MODEL}"
+case "$MODE" in
+  flexgen | infinigen | infinigen_ru | infinigen_ru_gp | kvswap) EXEC_KIND=main ;;
+  shadowkv)                                                       EXEC_KIND=shadowkv ;;
+  vllm)                                                           EXEC_KIND=vllm ;;
+  *)
+    echo "Unknown mode '$MODE' (expected flexgen|infinigen|infinigen_ru|infinigen_ru_gp|kvswap|shadowkv|vllm)"
+    exit 1
+    ;;
+esac
+
+# main.py and shadowkv both read/write the disk offload dir; vllm keeps
+# everything in GPU/host memory and never touches NVME_*.
+if [ "$EXEC_KIND" != "vllm" ]; then
+    for v in NVME_DEV_NAME NVME_OFFLOAD_DIR; do
+        if [ -z "${!v}" ]; then
+            echo "Error: $v is not set"
+            exit 1
+        fi
+    done
+fi
+
+# main.py runs against the fp16 np-weights conversion (scripts/setup_nano.sh);
+# shadowkv and vllm load the original HF checkpoint directly.
+if [ "$EXEC_KIND" = "main" ]; then
+    if [ -z "$MODEL_PATH_BASE" ]; then
+        echo "Error: MODEL_PATH_BASE is not set"
+        exit 1
+    fi
+    MODEL_PATH="${MODEL_PATH_BASE}/${TEST_MODEL}"
+    ADAPTER_DIR="${SAVE_DIR:-${MODEL_PATH_BASE}/local_adapters}"
+else
+    if [ -z "$MODEL_PATH_BASE_HF" ]; then
+        echo "Error: MODEL_PATH_BASE_HF is not set"
+        exit 1
+    fi
+    MODEL_PATH="${MODEL_PATH_BASE_HF}/${TEST_MODEL}"
+fi
 if [ ! -d "$MODEL_PATH" ]; then
-    echo "Error: $MODEL_PATH not found. Run scripts/setup_nano.sh (after scripts/download_models_nano.sh) first."
+    echo "Error: $MODEL_PATH not found. Run scripts/download_models_nano.sh (and scripts/setup_nano.sh for main.py modes) first."
     exit 1
 fi
-ADAPTER_DIR="${SAVE_DIR:-${MODEL_PATH_BASE}/local_adapters}"
 
 export CUDA_LAUNCH_BLOCKING=0
 export CUDA_VISIBLE_DEVICES="0"
-# Bytes preallocated per on-disk KV file (diskio/disk_interface.py). This is
-# disk space, not RAM, and NVMe has room to spare on this device — 1 GiB is
-# generous headroom for Qwen3-0.6B/1.7B at batch<=8, context<=32K. Raise it
-# if create_kv_file's "total_bytes <= MAX_ALLOC_KV_SIZE" assertion trips.
-export MAX_ALLOC_KV_SIZE="${MAX_ALLOC_KV_SIZE:-$((1024*1024*1024))}"
+if [ "$EXEC_KIND" != "vllm" ]; then
+    # Bytes preallocated per on-disk KV file (diskio/disk_interface.py). This is
+    # disk space, not RAM, and NVMe has room to spare on this device — 1 GiB is
+    # generous headroom for Qwen3-0.6B/1.7B at batch<=8, context<=32K. Raise it
+    # if create_kv_file's "total_bytes <= MAX_ALLOC_KV_SIZE" assertion trips.
+    export MAX_ALLOC_KV_SIZE="${MAX_ALLOC_KV_SIZE:-$((1024*1024*1024))}"
+fi
 
 source .venv/bin/activate
+
+if [ "$EXEC_KIND" = "shadowkv" ] && \
+   ! (cd src/shadowkv && python -c "import torch; from kernels import shadowkv") 2>/dev/null; then
+    (cd src/shadowkv && python -c "import torch; from kernels import shadowkv") 2>&1 | tail -5
+    echo "Error: shadowkv CUDA extension not importable. Build it first:"
+    echo "  cd src/shadowkv && MAX_JOBS=1 python setup.py build_ext --inplace"
+    exit 1
+fi
 
 check_hardware_soft
 check_powermode_soft
@@ -92,6 +164,9 @@ if [ "${APPLY_JETSON_CLOCKS:-1}" = "1" ]; then
     fi
 fi
 
+# One log directory for every mode — previously shadowkv logged under
+# logs/shadowkv/** and vllm under vllm_results/, separate from this dir and
+# from each other; now everything for a given model lands in one place.
 SET_LOG_DIR="${EVAL_LOG_DIR}/${EVAL_USER}/logs/nano/${TEST_MODEL}"
 mkdir -p "$SET_LOG_DIR"
 
@@ -150,20 +225,59 @@ case "$MODE" in
     EXTRA_ARGS="--max_num_kv $MAX_NUM_KV --start_layer 0-curr-emb --reuse_budget $MAX_NUM_KV --lr_proj_path $LR_PROJ_PATH"
     RUN_TAG="kvswap_p${RATIO}"
     ;;
-  *)
-    echo "Unknown mode '$MODE' (expected flexgen|infinigen|kvswap)"
-    exit 1
+  shadowkv)
+    # budget/chunk_size/rank default to values copied from the AGX sweep
+    # scripts (tab-4.sh/fig-10.sh) as a starting point, since the paper
+    # doesn't publish an Orin Nano/Qwen3-0.6B-specific setting.
+    BUDGET="${BUDGET:-400}"
+    CHUNK_SIZE="${CHUNK_SIZE:-16}"
+    RANK="${RANK:-40}"
+    RUN_TAG="shadowkv_budget${BUDGET}_chunk${CHUNK_SIZE}_r${RANK}"
+    ;;
+  vllm)
+    # AGX defaults (gpu_memory_utilization=0.85, max_model_len=32768) are
+    # sized for 64GB and fail to start on 8GB — see src/run_vllm.py.
+    export VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-$TOTAL_LEN}"
+    export VLLM_GPU_MEM_UTIL="${VLLM_GPU_MEM_UTIL:-0.6}"
     ;;
 esac
 
-echo "MODE=$MODE TEST_MODEL=$TEST_MODEL TOTAL_LEN=$TOTAL_LEN BATCH_LIST=[$BATCH_LIST] TOKEN_GROUP=$TOKEN_GROUP MAX_NUM_KV=$MAX_NUM_KV"
+echo "MODE=$MODE TEST_MODEL=$TEST_MODEL TOTAL_LEN=$TOTAL_LEN BATCH_LIST=[$BATCH_LIST]"
+
+# vllm sweeps every batch size in the BATCH_LIST from one loaded model (to
+# avoid reloading it per batch) and writes one CSV instead of one log per
+# batch, so it doesn't fit the per-batch loop the other modes use below.
+if [ "$EXEC_KIND" = "vllm" ]; then
+    BATCH_CSV="$(echo "$BATCH_LIST" | tr -s ' ' ',')"
+    RUN_LOG="${SET_LOG_DIR}/${TEST_MODEL}_vllm_cl${TOTAL_LEN}.log"
+
+    echo "Clearing system cache..."
+    sync
+    if echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1; then
+        echo "System cache cleared."
+    else
+        echo "[warn] No permission to clear system cache (sudo tee failed) — continuing without it."
+    fi
+    sleep 2
+
+    echo "Running vllm (all batches, one process) ..."
+    { python src/run_vllm.py --model_path "$MODEL_PATH" --output_path "$SET_LOG_DIR" \
+        --seqlen-list "$TOTAL_LEN" --batch-list "$BATCH_CSV"; } > "$RUN_LOG" 2>&1 \
+        || echo "  Run failed — see $RUN_LOG"
+
+    echo "--------------------------------"
+    echo "Done. Results: ${SET_LOG_DIR}/${TEST_MODEL}_results.csv, full log: $RUN_LOG"
+    exit 0
+fi
 
 for BATCHSIZE in $BATCH_LIST; do
     PROMPT_LEN=$((TOTAL_LEN - GEN_LEN))
     RUN_INFO="${TEST_MODEL}_${RUN_TAG}_b${BATCHSIZE}_cl${TOTAL_LEN}"
     LOG_OUT="${SET_LOG_DIR}/${RUN_INFO}.log"
+    DONE_PATTERN="Throughput Total:"
+    [ "$EXEC_KIND" = "shadowkv" ] && DONE_PATTERN="Throughput:"
 
-    if [ -f "$LOG_OUT" ] && grep -q "Throughput Total:" "$LOG_OUT" 2>/dev/null; then
+    if [ -f "$LOG_OUT" ] && grep -q "$DONE_PATTERN" "$LOG_OUT" 2>/dev/null; then
         echo "Skipping $RUN_INFO (already completed — see $LOG_OUT)"
         continue
     fi
@@ -179,12 +293,6 @@ for BATCHSIZE in $BATCH_LIST; do
     fi
 
     echo "Running $RUN_INFO ..."
-    CMD="--percent 100 0 0 0 100 0 --model_path $MODEL_PATH --offload_dir $NVME_OFFLOAD_DIR \
-         --prompt_len $PROMPT_LEN --gen_len $GEN_LEN --gpu_batch_size $BATCHSIZE --num_gpu_batches 1 \
-         --test_input_path ./data/test_inputs --run_args L4 --lr_proj_mode $LR_PROJ_MODE \
-         --use_token_cache 0 --dk_wr $DK_WR --dk_rd $DK_RD --token_group $TOKEN_GROUP \
-         --disk_dev_name $NVME_DEV_NAME --batch_split 1 --seed $SEED $EXTRA_ARGS \
-         --run_info ${SET_LOG_DIR}/${RUN_INFO}"
 
     # CPU/GPU/EMC/RAM/SWAP/power/disk-I/O sampling for this run, both at 1.0s
     # from one process — see scripts/jtop_logger.py (jtop only imports under
@@ -202,9 +310,28 @@ for BATCHSIZE in $BATCH_LIST; do
         echo "[jtop] $JTOP_PY not found — skipping resource logging for $RUN_INFO"
     fi
 
-    echo "CMD=$CMD" > "$LOG_OUT"
-    { python src/main.py $CMD --nv_profile 0; } >> "$LOG_OUT" 2>&1 || echo "  Run failed — see $LOG_OUT"
-    grep "Throughput Total:" "$LOG_OUT" || echo "  (no throughput line — check $LOG_OUT for errors, e.g. OOM at this batch size)"
+    if [ "$EXEC_KIND" = "shadowkv" ]; then
+        RUN_STDOUT="${SET_LOG_DIR}/${RUN_INFO}.run.log"
+        { python src/shadowkv/test/e2e_jetson.py --model_path "$MODEL_PATH" \
+            --min_prompt_len "$PROMPT_LEN" --bsz "$BATCHSIZE" --budget "$BUDGET" \
+            --genlen "$GEN_LEN" --input_path ./data/test_inputs \
+            --chunk_size "$CHUNK_SIZE" --rank "$RANK" --cache_dir "$NVME_OFFLOAD_DIR" \
+            --offload_device disk --log_file "$LOG_OUT" --seed "$SEED"; } \
+            > "$RUN_STDOUT" 2>&1 || echo "  Run failed — see $RUN_STDOUT"
+        grep "$DONE_PATTERN" "$LOG_OUT" 2>/dev/null \
+            || echo "  (no throughput line — check $LOG_OUT / $RUN_STDOUT for errors, e.g. OOM at this batch size)"
+    else
+        CMD="--percent 100 0 0 0 100 0 --model_path $MODEL_PATH --offload_dir $NVME_OFFLOAD_DIR \
+             --prompt_len $PROMPT_LEN --gen_len $GEN_LEN --gpu_batch_size $BATCHSIZE --num_gpu_batches 1 \
+             --test_input_path ./data/test_inputs --run_args L4 --lr_proj_mode $LR_PROJ_MODE \
+             --use_token_cache 0 --dk_wr $DK_WR --dk_rd $DK_RD --token_group $TOKEN_GROUP \
+             --disk_dev_name $NVME_DEV_NAME --batch_split 1 --seed $SEED $EXTRA_ARGS \
+             --run_info ${SET_LOG_DIR}/${RUN_INFO}"
+
+        echo "CMD=$CMD" > "$LOG_OUT"
+        { python src/main.py $CMD --nv_profile 0; } >> "$LOG_OUT" 2>&1 || echo "  Run failed — see $LOG_OUT"
+        grep "$DONE_PATTERN" "$LOG_OUT" || echo "  (no throughput line — check $LOG_OUT for errors, e.g. OOM at this batch size)"
+    fi
 
     if [ -n "$JTOP_PID" ]; then
         kill "$JTOP_PID" 2>/dev/null || true

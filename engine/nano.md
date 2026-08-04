@@ -27,9 +27,10 @@ Table 5의 flexgen/InfiniGen*/KVSwap/ShadowKV/vLLM 베이스라인을 재현한 
 | 기본 모델 | Llama-3.1-8B-Instruct / Qwen3-14B | Qwen3-0.6B |
 | 전원 모드 / 클록 확인 | `nvpmodel`이 정확히 `MAXN`을 보고하지 않거나 CPU/GPU devfreq가 하드코딩된 sysfs 경로에 고정되어 있지 않으면 강제 종료 | 확인한 값을 출력하고 종료 대신 경고만; `eval_nano.sh`가 각 배치 실행 전 `sudo jetson_clocks`를 직접 추가로 실행(권고 사항 — 비밀번호 없는 sudo가 필요하며, 없으면 클록은 그대로 둠) |
 | 어댑터 | 저장소에 `engine/data/adapters/`로 포함되어 배포됨 | Qwen3-0.6B/1.7B용이 `$MODEL_PATH_BASE/local_adapters`에 배포됨(저장소에 커밋됨, 아래 참고); `prepare_adapter_nano.sh`로 추가 생성 가능 |
-| vLLM 베이스라인 | `run_vllm.sh`가 `setup.sh`처럼 강제 종료; `run_vllm.py`는 `gpu_memory_utilization=0.85`/`max_model_len=32768`을 하드코딩 | `run_vllm_nano.sh`; 두 값 모두 환경변수로 오버라이드 가능(`VLLM_GPU_MEM_UTIL`/`VLLM_MAX_MODEL_LEN`) — AGX 기본값은 8GB에 맞지 않기 때문 |
-| ShadowKV 베이스라인 | `src/shadowkv/run_shadowkv.sh`가 `setup.sh`처럼 강제 종료 | `run_shadowkv_nano.sh`, 동등한 소프트 체크, 동일한 `test/e2e_jetson.py` 드라이버 사용 |
-| 리소스 로깅 | 없음 | `eval_nano.sh`가 `scripts/jtop_logger.py`를 자동으로 연결 — 실행당 초당 1회 CPU/GPU/EMC/RAM/전력/디스크 I/O 샘플 |
+| vLLM 베이스라인 | `run_vllm.sh`가 `setup.sh`처럼 강제 종료; `run_vllm.py`는 `gpu_memory_utilization=0.85`/`max_model_len=32768`을 하드코딩 | `eval_nano.sh vllm` 모드; 두 값 모두 환경변수로 오버라이드 가능(`VLLM_GPU_MEM_UTIL`/`VLLM_MAX_MODEL_LEN`) — AGX 기본값은 8GB에 맞지 않기 때문 |
+| ShadowKV 베이스라인 | `src/shadowkv/run_shadowkv.sh`가 `setup.sh`처럼 강제 종료 | `eval_nano.sh shadowkv` 모드, 동등한 소프트 체크, 동일한 `test/e2e_jetson.py` 드라이버 사용 |
+| 리소스 로깅 | 없음 | `eval_nano.sh`가 `scripts/jtop_logger.py`를 자동으로 연결 — 실행당 초당 1회 CPU/GPU/EMC/RAM/전력/디스크 I/O 샘플 (`vllm` 모드는 예외 — 배치 전체를 한 프로세스에서 실행) |
+| 결과 로그 | 베이스라인별로 별도 경로(엔진/ShadowKV/vLLM 각자 다른 디렉터리) | 모든 모드가 하나의 트리에 기록: `$EVAL_LOG_DIR/$EVAL_USER/logs/nano/<model>/` |
 
 ## 파일 구성
 
@@ -54,8 +55,13 @@ Table 5의 flexgen/InfiniGen*/KVSwap/ShadowKV/vLLM 베이스라인을 재현한 
   자체 `.pt` 파일들과 마찬가지로 순수 바이너리로 여기에 커밋되어 있다. 현재 Qwen3-0.6B(KVSwap
   저랭크 비율 1.0/0.25 + InfiniGen* skew 비율 0.125)와 Qwen3-1.7B(KVSwap 저랭크 비율
   1.0/0.25)에 대해 채워져 있다.
-- **`scripts/eval_nano.sh`** — `src/main.py`용 NVMe 전용 드라이버로, 다섯 가지 모드가 있다:
-  - `flexgen` — 예측 없는 풀-KV 베이스라인, **어댑터 불필요**. 가장 먼저 실행할 것.
+- **`scripts/eval_nano.sh`** — Orin Nano에서 평가하는 모든 베이스라인을 위한 NVMe 전용 드라이버로,
+  일곱 가지 모드가 있다. 원래는 별도 스크립트 세 개(이 스크립트, `run_vllm_nano.sh`,
+  `run_shadowkv_nano.sh`)가 각자 다른 결과 트리에 기록했지만, 뒤의 두 스크립트는 사라지고 이
+  스크립트 하나로 통합되었으며, 이제 모든 모드가 동일한 디렉터리에 로그를 남긴다(아래 "결과 로그"
+  참고).
+  - `flexgen` — `src/main.py` 기반, 예측 없는 풀-KV 베이스라인, **어댑터 불필요**. 가장 먼저
+    실행할 것.
   - `infinigen` — InfiniGen* 스타일의 인덱스 선택형 예측기. skew 어댑터가 필요
     (`prepare_adapter_nano.sh --with-infinigen`).
   - `infinigen_ru` / `infinigen_ru_gp` — 동일한 InfiniGen* 예측기에 KVSwap의 재사용 버퍼
@@ -63,23 +69,27 @@ Table 5의 flexgen/InfiniGen*/KVSwap/ShadowKV/vLLM 베이스라인을 재현한 
     ablation 체인(§4.2)을 `kvswap` 모드가 쓰는 것과 동일한 `--reuse_budget`/`--token_group`
     플래그로 재현한다(두 플래그 모두 `main.py`에 일반적인 것이며 KVSwap 전용이 아니다).
     `infinigen`과 동일한 skew 어댑터가 필요하다.
-  - `kvswap` — 실제 KVSwap 저랭크 예측기. KVSwap 어댑터 필요
+  - `kvswap` — `src/main.py` 기반, 실제 KVSwap 저랭크 예측기. KVSwap 어댑터 필요
     (`prepare_adapter_nano.sh`, 별도 플래그 불필요).
+  - `shadowkv` — `src/shadowkv/test/e2e_jetson.py` 기반 ShadowKV 베이스라인. ShadowKV CUDA
+    확장이 미리 빌드되어 있어야 한다
+    (`cd src/shadowkv && MAX_JOBS=1 python setup.py build_ext --inplace` — `MAX_JOBS=1`은 8GB
+    통합 메모리에서 중요하다, "알려진 한계" 참고). `BUDGET`/`CHUNK_SIZE`/`RANK` 환경변수는
+    논문이 Orin Nano/Qwen3-0.6B에 특화된 값을 공개하지 않으므로 시작점으로서 AGX 스윕 스크립트
+    (`tab-4.sh`/`fig-10.sh`)에서 복사한 값을 기본값으로 사용한다. 위의 `src/main.py` 기반
+    모드들과 달리 `MODEL_PATH_BASE`가 아니라 `MODEL_PATH_BASE_HF`에서 가중치를 읽는다.
+  - `vllm` — `src/run_vllm.py` 기반 vLLM "오프로딩 없음" 상한 베이스라인. `VLLM_GPU_MEM_UTIL`/
+    `VLLM_MAX_MODEL_LEN` 환경변수로 8GB에 맞춘다(AGX 기본값인 0.85/32768은 여기서 시작에
+    실패한다); `VLLM_MAX_MODEL_LEN`의 기본값은 `total_len` 인자다. 이 모드도
+    `MODEL_PATH_BASE_HF`에서 읽으며, 다른 모든 모드와 달리 배치 리스트 전체를 한 프로세스에서
+    스윕하고(배치마다 모델을 다시 로드하지 않기 위함) 배치당 로그 한 개 대신 CSV 하나를
+    기록하므로, 다른 모드들이 받는 배치별 jtop/diskio 샘플링은 건너뛴다.
 
-  또한 각 배치 실행 전에 `sudo jetson_clocks`를 적용하고(건너뛰려면 `APPLY_JETSON_CLOCKS=0`
-  설정), 배치 사이에 페이지 캐시를 비우며(권고 사항, 비밀번호 없는 sudo 필요), 각 실행 전후로
-  `scripts/jtop_logger.py`를 시작/중지한다(아래 참고) — jetson-stats가 기본 경로
-  `/home/jetson/.local/share/jtop/bin/python`에 없다면 `JTOP_PY`로 경로를 오버라이드할 것.
-- **`scripts/run_vllm_nano.sh`** — `scripts/run_vllm.sh`의 소프트 체크 버전. vLLM "오프로딩
-  없음" 베이스라인을 8GB에 맞추려면 `VLLM_GPU_MEM_UTIL`/`VLLM_MAX_MODEL_LEN`을 설정할 것
-  (AGX 기본값인 0.85/32768은 여기서 시작에 실패한다); `VLLM_MAX_MODEL_LEN`의 기본값은 테스트 중인
-  가장 큰 seqlen이다.
-- **`scripts/run_shadowkv_nano.sh`** — `src/shadowkv/run_shadowkv.sh`의 소프트 체크 버전.
-  ShadowKV CUDA 확장이 미리 빌드되어 있어야 한다
-  (`cd src/shadowkv && MAX_JOBS=1 python setup.py build_ext --inplace` — `MAX_JOBS=1`은 8GB
-  통합 메모리에서 중요하다, "알려진 한계" 참고). `budget`/`chunk_size`/`rank`는 논문이 Orin
-  Nano/Qwen3-0.6B에 특화된 값을 공개하지 않으므로 시작점으로서 AGX 스윕 스크립트
-  (`tab-4.sh`/`fig-10.sh`)에서 복사한 값을 기본값으로 사용한다.
+  `src/main.py`/`shadowkv` 모드는 또한 각 배치 실행 전에 `sudo jetson_clocks`를 적용하고
+  (건너뛰려면 `APPLY_JETSON_CLOCKS=0` 설정), 배치 사이에 페이지 캐시를 비우며(권고 사항,
+  비밀번호 없는 sudo 필요), 각 실행 전후로 `scripts/jtop_logger.py`를 시작/중지한다(아래 참고) —
+  jetson-stats가 기본 경로 `/home/jetson/.local/share/jtop/bin/python`에 없다면 `JTOP_PY`로
+  경로를 오버라이드할 것.
 - **`scripts/jtop_logger.py`** — `engine/.venv`가 아니라 jetson-stats 자체의 venv 하에서
   실행되어야 한다(`jtop`을 임포트 가능한 모듈로 제공하는 곳이 거기뿐이다). 한 프로세스 안에서
   1Hz로 동작하는 세 개의 샘플링 루프(이 jetson-stats 버전에서 jtop의 *클라이언트*는 1.0초
@@ -88,12 +98,13 @@ Table 5의 flexgen/InfiniGen*/KVSwap/ShadowKV/vLLM 베이스라인을 재현한 
   API는 디스크 *용량*만 노출하고 I/O는 노출하지 않는다); 그리고 `sudo tegrastats`를 통한 EMC
   대역폭 %(jtop 자체의 `EMC` 통계값은 이 보드에서 잘못되어 있다 — 아래 알려진 한계 참고).
   `<run>.jtop.csv` + `<run>.diskio.csv`를 기록한다.
-- **`scripts/analyze_nano_results.py`** — `eval_nano.sh`/ShadowKV/vLLM 로그와 jtop+diskio
-  CSV들을 하나의 비교 결과로 파싱한다: 메서드/배치별 디코드 전용 처리량, 엔진 자체의 `Swap:`
-  로그 라인으로부터 얻는 레이어당 디스크 비용, prefill/decode 구간별 리소스 사용량, 디스크 I/O
-  ablation 차트. `.venv/bin/python scripts/analyze_nano_results.py`로 실행(`pandas`/
-  `matplotlib` 필요, 이미 `engine/.venv`에 있음); 기본적으로 CSV와 PNG를 `RESULTS/nano/`에
-  기록한다.
+- **`scripts/analyze_nano_results.py`** — `eval_nano.sh`의 모든 모드가 남긴 로그(`main.py`/
+  ShadowKV 실행은 동일한 `.log` 파일명 규칙을 공유하고, vLLM은 자체 CSV를 쓴다 — 셋 다 이제
+  하나의 `logs/nano/<model>/` 트리 아래에 있다)와 jtop+diskio CSV들을 하나의 비교 결과로
+  파싱한다: 메서드/배치별 디코드 전용 처리량, 엔진 자체의 `Swap:` 로그 라인으로부터 얻는
+  레이어당 디스크 비용, prefill/decode 구간별 리소스 사용량, 디스크 I/O ablation 차트.
+  `.venv/bin/python scripts/analyze_nano_results.py`로 실행(`pandas`/`matplotlib` 필요, 이미
+  `engine/.venv`에 있음); 기본적으로 CSV와 PNG를 `RESULTS/nano/`에 기록한다.
 
 ## 사용법
 
@@ -127,9 +138,9 @@ bash ./scripts/prepare_adapter_nano.sh          # InfiniGen* 베이스라인도 
 # 5. KVSwap 자체 실행
 bash ./scripts/eval_nano.sh kvswap
 
-# 6. main.py 외부의 베이스라인들
-bash ./scripts/run_vllm_nano.sh                     # vLLM, 오프로딩 없음
-bash ./scripts/run_shadowkv_nano.sh                 # ShadowKV(먼저 CUDA 확장을 빌드할 것, 위 참고)
+# 6. main.py 외부의 베이스라인들 — 동일한 진입점, 동일한 로그 트리
+bash ./scripts/eval_nano.sh vllm                    # vLLM, 오프로딩 없음
+bash ./scripts/eval_nano.sh shadowkv                # ShadowKV(먼저 CUDA 확장을 빌드할 것, 위 참고)
 
 # 7. 한 묶음의 실행이 완료되면 로그를 비교:
 .venv/bin/python scripts/analyze_nano_results.py
@@ -141,12 +152,17 @@ bash ./scripts/run_shadowkv_nano.sh                 # ShadowKV(먼저 CUDA 확�
 bash ./scripts/eval_nano.sh kvswap 16384 "1 2 4 8"
 RATIO=0.25 bash ./scripts/eval_nano.sh kvswap 32768 "1 4"   # 예산이 빠듯한 어댑터
 bash ./scripts/eval_nano.sh infinigen_ru_gp 16384 "1 2"     # InfiniGen* + 재사용 버퍼 + 그룹 I/O
+bash ./scripts/eval_nano.sh shadowkv 16384 "1 2 4"          # ShadowKV
+bash ./scripts/eval_nano.sh vllm 16384 "1 2 4 8"            # vLLM, 오프로딩 없음
 ```
 
-로그는 `$EVAL_LOG_DIR/$EVAL_USER/logs/nano/<model>/` 아래에 `(mode, batch, context)` 조합당
-파일 하나씩 저장된다; 재실행 시 이미 `Throughput Total:` 라인이 있는 로그는 건너뛴다 —
-`scripts/eval.sh`와 동일한 규칙이다. jetson-stats가 설치되어 있다면 각 로그마다 `.jtop.csv` +
-`.diskio.csv` 쌍도 함께 생성된다(위 `scripts/jtop_logger.py` 참고).
+`shadowkv`와 `vllm`을 포함한 모든 모드의 로그는 `$EVAL_LOG_DIR/$EVAL_USER/logs/nano/<model>/`
+하나의 디렉터리 아래에 저장된다. `src/main.py` 및 `shadowkv` 모드는 `(mode, batch, context)`
+조합당 파일 하나씩 기록하며, 재실행 시 이미 완료 라인이 있는 로그는 건너뛴다(`src/main.py`
+모드는 `Throughput Total:`, `shadowkv`는 `Throughput:`) — `scripts/eval.sh`와 동일한 규칙이다.
+jetson-stats가 설치되어 있다면 각 로그마다 `.jtop.csv` + `.diskio.csv` 쌍도 함께 생성된다(위
+`scripts/jtop_logger.py` 참고). `vllm` 모드는 예외다: 배치 크기 전체를 한 프로세스에서
+스윕하여 (jtop/diskio 쌍 없이) 같은 디렉터리에 `<model>_results.csv` 파일 하나만 기록한다.
 
 ## 알려진 한계 / 확인해야 할 사항
 
