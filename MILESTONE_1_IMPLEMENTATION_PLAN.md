@@ -138,11 +138,23 @@ Qwen3-MoE attention은 dense Qwen3와 같은 q/k norm 및 rotary 처리를 사�
 ### 단계 E — KVSwap coexistence
 
 - 동일 fixture를 `lr_proj_mode=none`으로 먼저 실행
-- shape-compatible deterministic predictor artifact를 생성하거나 selector 결과를 주입해 KVSwap 경로 실행
-- KVSwap attention 직후의 동일 hidden state를 HF MoE block에도 입력하여 MoE 부분만 비교
-- dense Qwen3 Nano smoke test를 다시 실행해 회귀 확인
+- fixture 전용 deterministic `lr_proj_mh` artifact를 별도 생성한다. 각 layer의
+  `lr_kproj`는 fixture KV width와 맞는 identity projection이며 학습된 adapter나 성능
+  결과로 취급하지 않는다.
+- `token_group=2`, `max_num_kv=64`, `reuse_budget=0`인 all-group lane으로 predictor,
+  NVMe read, `CacheManager` 및 patched PagedAttention을 모두 통과시키면서 full-KV
+  fixture와 greedy token equality를 요구한다. Group size 2는 fixture model의
+  256-byte/token KV를 512-byte direct-I/O 단위에 맞춘다.
+- 실제 `Qwen3-0.6B`와 기존 adapter의 짧은 KVSwap smoke를 실행해 Qwen family의
+  attention/qnorm/RMSNorm 변경이 기존 predictor와 KV path를 깨지 않았는지 확인한다.
+- 정적 검사로 `MoEBlock`과 expert provider가 `CacheManager`, KV disk tensor 또는 KV
+  copy queue를 직접 소유하거나 호출하지 않음을 확인한다.
 
-**Gate E:** expert path가 `CacheManager`를 직접 호출하지 않고, 선택 group에서 계산한 expected KV bytes와 trace가 일치하며, expert storage I/O event가 0이어야 한다. MoE 통합 전후의 selection ID 동일성은 요구하지 않는다.
+**Gate E:** all-group fixture lane은 full-KV fixture token과 일치하고 selected group에서
+계산한 expected KV bytes/request count가 trace와 일치해야 한다. Dense Qwen3 KVSwap smoke도
+완료되어야 하며, expert path는 `CacheManager`나 KV storage를 직접 호출하지 않아야 한다.
+이 gate는 KVSwap approximation 품질을 재평가하는 실험이 아니라 이후 expert code가 기존
+KV 경로를 손상하지 않음을 보장하는 영구 regression contract다.
 
 ### 단계 F — 실제 checkpoint 검증
 
@@ -160,8 +172,9 @@ Qwen3-MoE attention은 dense Qwen3와 같은 q/k norm 및 rotary 처리를 사�
 cd engine
 PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_moe_*.py'
 bash scripts/eval_moe_m1.sh fixture-fullkv
-# Planned gates; these modes are not implemented yet:
-# bash scripts/eval_moe_m1.sh fixture-kvswap
+bash scripts/eval_moe_m1.sh fixture-kvswap
+bash scripts/eval_moe_m1.sh dense-kvswap
+# Planned gate; this mode is not implemented yet:
 # bash scripts/eval_moe_m1.sh real-parity  # large-memory server only
 ```
 
@@ -212,8 +225,14 @@ MEMORY_ALLOC: object=router|expert|workspace, layer, bytes, dtype
 - [x] tiny fixture의 aggregate MoE output이 reference와 일치한다.
 - [x] full-KV fixture의 2-token greedy output이 HF reference와 일치하고 두 번 반복해 동일하다.
 - [ ] 실제 checkpoint의 short greedy output이 HF reference와 일치한다.
-- [ ] KVSwap KV 경로와 resident MoE가 함께 실행된다.
-- [ ] 기존 dense Qwen3 smoke test에 기능 회귀가 없다.
+- [x] KVSwap KV 경로와 resident MoE가 함께 실행된다. Identity fixture adapter의
+  all-group lane이 full-KV와 동일한 `token_99 token_8`을 생성했고, 2개 layer의
+  128 selected KV tokens가 32,768 bytes라는 계산과 trace에서 일치했다.
+- [x] 기존 dense Qwen3 smoke test에 기능 회귀가 없다. Orin Nano에서
+  `Qwen3-0.6B`(약 0.8B parameters), prompt 64, decode 2, batch 1 full-KV 실행이
+  peak RSS 2.790 GiB로 완료되었다. 동일 입력의 all-group KVSwap 실행도 같은
+  `The team`을 생성했고, 28개 layer의 1,792 selected tokens(7.0 MiB)가 trace와
+  일치했으며 peak RSS는 2.856 GiB였다.
 - [x] expert I/O/cache/prefetch 코드가 M1에 섞이지 않았다.
 - [x] shard open 전 resident capacity estimate와 fixture peak usage 및 재현 명령이 보존되었다.
 

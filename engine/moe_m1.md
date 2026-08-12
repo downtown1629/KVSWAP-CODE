@@ -57,12 +57,26 @@ bash scripts/eval_moe_m1.sh static
 bash scripts/eval_moe_m1.sh fixture-cpu
 bash scripts/eval_moe_m1.sh fixture-cuda
 bash scripts/eval_moe_m1.sh fixture-fullkv
+bash scripts/eval_moe_m1.sh fixture-kvswap
+bash scripts/eval_moe_m1.sh dense-kvswap       # requires .env_nano and local adapter
 ```
 
 On Orin, the initial full-KV fixture run matched the HF greedy IDs `[99, 8]`.
 It recorded 1.603 GiB peak process RSS, 15 MiB peak Torch allocation, and 21
 MiB peak Torch reservation. These numbers include runtime overhead and are not
 a capacity estimate for the real 30B checkpoint.
+
+`fixture-kvswap` is a permanent integration regression, not a KVSwap quality
+evaluation. It creates a full-rank identity projector for the fixture, selects
+all 64 prompt KV tokens in two-token direct-I/O groups, and exercises the
+predictor, NVMe path, `CacheManager`, and patched PagedAttention. On Orin it
+matched `token_99 token_8`; its trace accounted for 128 selected tokens and
+32,768 read bytes across two layers with 1.564 GiB peak RSS.
+
+The existing dense path was also checked with Qwen3-0.6B, prompt 64, two decode
+tokens, and batch one. Full-KV and all-group KVSwap both generated `The team`.
+The KVSwap run selected 1,792 tokens (7.0 MiB) across 28 layers and used 2.851
+GiB peak RSS. These short runs are regression evidence, not throughput results.
 
 ## Current Boundary
 

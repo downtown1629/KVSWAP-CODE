@@ -43,6 +43,17 @@ class MoEFixtureStaticTest(unittest.TestCase):
         self.assertIn('default="cpu"', verifier)
         self.assertNotIn("Qwen3MoeForCausalLM", verifier)
 
+    def test_kvswap_adapter_is_identity_and_fixture_only(self):
+        adapter = (
+            Path(__file__).parents[1]
+            / "scripts"
+            / "make_tiny_qwen3_kvswap_adapter.py"
+        ).read_text()
+        self.assertIn('torch.eye(kv_width, dtype=torch.bfloat16)', adapter)
+        self.assertIn('"integration-regression-only"', adapter)
+        self.assertIn('fixture_dir / "m1_fixture.json"', adapter)
+        self.assertIn("FileExistsError", adapter)
+
 
 if __name__ == "__main__":
     unittest.main()

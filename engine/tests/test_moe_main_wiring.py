@@ -8,6 +8,9 @@ class MoEMainWiringStaticTest(unittest.TestCase):
     def setUpClass(cls):
         cls.source_path = Path(__file__).parents[1] / "src" / "main.py"
         cls.tree = ast.parse(cls.source_path.read_text())
+        cls.moe_tree = ast.parse(
+            (Path(__file__).parents[1] / "src" / "moe.py").read_text()
+        )
 
     def test_moe_block_implements_legacy_layer_protocol(self):
         moe_block = next(
@@ -230,6 +233,29 @@ class MoEMainWiringStaticTest(unittest.TestCase):
             and node.func.id == "init_weight_list"
         ]
         self.assertEqual(len(branch_calls), 1)
+
+    def test_moe_path_does_not_own_kv_cache_or_copy_queue(self):
+        protected_classes = {
+            node.name: ast.unparse(node)
+            for node in self.tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name in {"MoEBlock", "Qwen3ResidentExpertProviderFactory"}
+        }
+        protected_classes.update({
+            node.name: ast.unparse(node)
+            for node in self.moe_tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name in {"ExpertProvider", "ResidentExpertProvider"}
+        })
+        self.assertEqual(set(protected_classes), {
+            "MoEBlock", "Qwen3ResidentExpertProviderFactory",
+            "ExpertProvider", "ResidentExpertProvider",
+        })
+        for source in protected_classes.values():
+            self.assertNotIn("CacheManager", source)
+            self.assertNotIn("general_copy", source)
+            self.assertNotIn("prefetch_cache", source)
+            self.assertNotIn("submit_copy", source)
 
 
 if __name__ == "__main__":
