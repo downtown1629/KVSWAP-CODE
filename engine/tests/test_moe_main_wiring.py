@@ -30,6 +30,43 @@ class MoEMainWiringStaticTest(unittest.TestCase):
             }.issubset(methods)
         )
 
+    def test_expert_provider_factory_owns_resident_expert_load(self):
+        factory = next(
+            node
+            for node in self.tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "Qwen3ResidentExpertProviderFactory"
+        )
+        create = next(
+            node
+            for node in factory.body
+            if isinstance(node, ast.FunctionDef) and node.name == "create"
+        )
+        call_names = {
+            node.func.id
+            for node in ast.walk(create)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        self.assertIn("load_qwen3_moe_expert_bank", call_names)
+
+        moe_block = next(
+            node
+            for node in self.tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "MoEBlock"
+        )
+        init_weight = next(
+            node
+            for node in moe_block.body
+            if isinstance(node, ast.FunctionDef) and node.name == "init_weight"
+        )
+        block_call_names = {
+            node.func.id
+            for node in ast.walk(init_weight)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        self.assertIn("load_qwen3_moe_fixed_weights", block_call_names)
+        self.assertNotIn("load_qwen3_moe_expert_bank", block_call_names)
+
     def test_resident_preflight_precedes_cuda_device_creation(self):
         run_flexgen = next(
             node
@@ -74,6 +111,37 @@ class MoEMainWiringStaticTest(unittest.TestCase):
             and node.func.id == "SafetensorCheckpoint"
         )
         self.assertLess(budget_line, shard_open_line)
+
+    def test_capacity_gate_precedes_weight_shard_open_and_cuda(self):
+        run_flexgen = next(
+            node
+            for node in self.tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "run_flexgen"
+        )
+        calls = [node for node in ast.walk(run_flexgen) if isinstance(node, ast.Call)]
+        capacity_line = min(
+            node.lineno
+            for node in calls
+            if isinstance(node.func, ast.Name)
+            and node.func.id == "validate_resident_memory_capacity"
+        )
+        shard_line = min(
+            node.lineno
+            for node in calls
+            if isinstance(node.func, ast.Name)
+            and node.func.id == "SafetensorCheckpoint"
+        )
+        cuda_line = min(
+            node.lineno
+            for node in calls
+            if isinstance(node.func, ast.Name)
+            and node.func.id == "TorchDevice"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value == "cuda:0"
+        )
+        self.assertLess(capacity_line, shard_line)
+        self.assertLess(capacity_line, cuda_line)
 
     def test_checkpoint_preflight_precedes_tokenizer_loading(self):
         run_flexgen = next(
@@ -133,6 +201,35 @@ class MoEMainWiringStaticTest(unittest.TestCase):
         source = self.source_path.read_text()
         self.assertIn('"--moe_resident_weight_limit_gb"', source)
         self.assertIn("default=0.0", source)
+
+    def test_qk_norm_weight_load_is_owned_by_qwen3_family_branch(self):
+        attention = next(
+            node
+            for node in self.tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "SelfAttention"
+        )
+        init_weight = next(
+            node
+            for node in attention.body
+            if isinstance(node, ast.FunctionDef) and node.name == "init_weight"
+        )
+        family_branch = next(
+            node
+            for node in ast.walk(init_weight)
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Call)
+            and isinstance(node.test.func, ast.Name)
+            and node.test.func.id == "is_qwen3_family"
+        )
+        branch_calls = [
+            node
+            for statement in family_branch.body
+            for node in ast.walk(statement)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "init_weight_list"
+        ]
+        self.assertEqual(len(branch_calls), 1)
 
 
 if __name__ == "__main__":

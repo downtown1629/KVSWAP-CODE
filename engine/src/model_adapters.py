@@ -22,6 +22,65 @@ def is_qwen3_family(model_type):
     return model_type in ("qwen3", "qwen3_moe")
 
 
+def validate_qwen3_moe_config(config):
+    """Reject an inconsistent canonical Qwen3-MoE config before allocation."""
+    if getattr(config, "model_type", None) != "qwen3_moe":
+        raise ValueError("expected model_type=qwen3_moe")
+
+    positive_integer_fields = (
+        "hidden_size",
+        "head_dim",
+        "num_attention_heads",
+        "num_kv_heads",
+        "num_hidden_layers",
+        "intermediate_size",
+        "moe_intermediate_size",
+        "num_experts",
+        "num_experts_per_tok",
+        "decoder_sparse_step",
+        "vocab_size",
+        "max_position_embeddings",
+    )
+    for field in positive_integer_fields:
+        value = getattr(config, field, None)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError(f"{field} must be a positive integer, got {value!r}")
+
+    if config.num_attention_heads % config.num_kv_heads != 0:
+        raise ValueError("num_attention_heads must be divisible by num_kv_heads")
+    if config.num_experts_per_tok > config.num_experts:
+        raise ValueError("num_experts_per_tok cannot exceed num_experts")
+    if config.max_position_embeddings < 32768:
+        raise ValueError("max_position_embeddings must be at least 32768")
+
+    epsilon = getattr(config, "rms_norm_eps", None)
+    if not isinstance(epsilon, (int, float)) or isinstance(epsilon, bool) or epsilon <= 0:
+        raise ValueError(f"rms_norm_eps must be positive, got {epsilon!r}")
+    if not isinstance(getattr(config, "norm_topk_prob", None), bool):
+        raise ValueError("norm_topk_prob must be boolean")
+
+    mlp_only_layers = getattr(config, "mlp_only_layers", None)
+    if not isinstance(mlp_only_layers, list):
+        raise ValueError("mlp_only_layers must be a list")
+    if any(
+        not isinstance(layer, int)
+        or isinstance(layer, bool)
+        or not 0 <= layer < config.num_hidden_layers
+        for layer in mlp_only_layers
+    ):
+        raise ValueError("mlp_only_layers contains an invalid layer index")
+    if len(set(mlp_only_layers)) != len(mlp_only_layers):
+        raise ValueError("mlp_only_layers contains duplicate layer indices")
+
+    if not any(
+        layer not in set(mlp_only_layers)
+        and (layer + 1) % config.decoder_sparse_step == 0
+        for layer in range(config.num_hidden_layers)
+    ):
+        raise ValueError("Qwen3-MoE config does not contain a routed MoE layer")
+    return config
+
+
 def get_ffn_kind(config, layer_id):
     """Return the FFN kind using the Qwen3-MoE layer scheduling rule."""
     if not 0 <= layer_id < config.num_hidden_layers:

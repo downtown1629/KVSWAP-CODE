@@ -6,6 +6,11 @@ Resident execution is disabled unless an explicit weight budget is supplied.
 Qwen3-30B-A3B BF16 requires 56.8705 GiB for checkpoint weights alone, so it
 must not be loaded on an 8 GB Orin Nano.
 
+The weight limit is user approval, not the OOM check. Before opening checkpoint
+shards, the engine also compares weights, planned KV/activations, workspace,
+the largest source tensor, and configurable system headroom against
+`MemAvailable` and the CUDA allocator limit. The default headroom is 2 GiB.
+
 ## Safe Validation Order
 
 Run metadata validation before downloading or opening model shards:
@@ -63,8 +68,20 @@ a capacity estimate for the real 30B checkpoint.
 
 `ResidentExpertProvider` returns references to resident expert banks. The MoE
 primitive owns routing and expert arithmetic but never calls `CacheManager` or
-storage APIs. M2 should replace only this provider with demand materialization.
-M1 does not implement expert caching, prefetch, quantization, or fused kernels.
+storage APIs. `MoEBlock` loads router/norm weights separately and obtains the
+expert bank through a provider factory. M2 replaces that factory with demand
+materialization while preserving the primitive; its cache and asynchronous
+storage interfaces will be defined from measured M2 requirements. M1 does not
+implement expert caching, prefetch, quantization, or fused kernels.
+
+`--moe_token_chunk_size` bounds routed-token temporaries during prefill. The
+default is 8192; lowering it trades extra launches for lower peak memory. A
+layer-level NVTX range is available without emitting per-token traces.
+
+This boundary is intentionally narrow for future models: fixed layer weights,
+expert providers, config validation, and memory accounting may be shared.
+Qwen3.5 hybrid recurrent state, Maple weight representation, and Gemma's
+parallel dense/routed FFN remain model-specific adapter work.
 
 Full engine generation and KVSwap coexistence remain integration gates. Do not
 claim M1 complete from metadata or isolated-layer parity alone. Record device,

@@ -225,6 +225,51 @@ class Qwen3MoeLayerWeights:
     down_proj: torch.Tensor
 
 
+@dataclass(frozen=True)
+class Qwen3MoeFixedWeights:
+    router: torch.Tensor
+    post_attention_norm: torch.Tensor
+
+
+@dataclass(frozen=True)
+class Qwen3MoeExpertBank:
+    gate_proj: torch.Tensor
+    up_proj: torch.Tensor
+    down_proj: torch.Tensor
+
+
+@dataclass(frozen=True)
+class ResidentMemoryPlan:
+    weights: int
+    memory_kv: int
+    gpu_kv: int
+    memory_activations: int
+    gpu_activations: int
+    workspace: int
+    staging: int
+    system_headroom: int
+
+    @property
+    def system_required(self):
+        return (
+            self.weights
+            + self.memory_kv
+            + self.memory_activations
+            + self.workspace
+            + self.staging
+            + self.system_headroom
+        )
+
+    @property
+    def cuda_required(self):
+        return (
+            self.weights
+            + self.gpu_kv
+            + self.gpu_activations
+            + self.workspace
+        )
+
+
 def qwen3_moe_layer_expected(config, layer_id, dtype=torch.bfloat16):
     spec = get_qwen3_moe_layer_spec(config, layer_id)
     if spec is None:
@@ -319,6 +364,152 @@ def qwen3_moe_resident_bytes(config, dtype=torch.bfloat16):
     return total
 
 
+def qwen3_moe_largest_tensor_bytes(config, dtype=torch.bfloat16):
+    """Maximum CPU source tensor live beside its final resident destination."""
+    element_size = torch.empty((), dtype=dtype).element_size()
+    return max(
+        math.prod(shape) * element_size
+        for shape, _ in qwen3_moe_resident_expected(config, dtype=dtype).values()
+    )
+
+
+def estimate_qwen3_moe_resident_memory(
+    config,
+    gpu_batch_size,
+    num_gpu_batches,
+    prompt_len,
+    gen_len,
+    cache_gpu_percent,
+    cache_cpu_percent,
+    activation_gpu_percent,
+    activation_cpu_percent,
+    flash_attention,
+    system_headroom_bytes,
+    dtype=torch.bfloat16,
+):
+    """Conservatively estimate unified-memory demand before opening shards."""
+    if min(gpu_batch_size, num_gpu_batches, prompt_len, gen_len) <= 0:
+        raise ValueError("batch sizes and sequence lengths must be positive")
+    percentages = (
+        cache_gpu_percent,
+        cache_cpu_percent,
+        activation_gpu_percent,
+        activation_cpu_percent,
+    )
+    if any(value < 0 or value > 100 for value in percentages):
+        raise ValueError("memory percentages must be in [0, 100]")
+    if cache_gpu_percent + cache_cpu_percent > 100:
+        raise ValueError("cache GPU and CPU percentages exceed 100")
+    if activation_gpu_percent + activation_cpu_percent > 100:
+        raise ValueError("activation GPU and CPU percentages exceed 100")
+    if system_headroom_bytes < 0:
+        raise ValueError("system headroom must be non-negative")
+
+    element_size = torch.empty((), dtype=dtype).element_size()
+    total_batch = gpu_batch_size * num_gpu_batches
+    sequence = prompt_len + gen_len - 1
+    kv_bytes = (
+        2
+        * total_batch
+        * sequence
+        * config.num_hidden_layers
+        * config.num_kv_heads
+        * config.head_dim
+        * element_size
+    )
+    activation_bytes = total_batch * sequence * config.hidden_size * element_size * 3
+    memory_kv = math.ceil(
+        kv_bytes * (cache_gpu_percent + cache_cpu_percent) / 100
+    )
+    gpu_kv = math.ceil(kv_bytes * cache_gpu_percent / 100)
+    memory_activations = math.ceil(
+        activation_bytes
+        * (activation_gpu_percent + activation_cpu_percent)
+        / 100
+    )
+    gpu_activations = math.ceil(
+        activation_bytes * activation_gpu_percent / 100
+    )
+
+    tokens = gpu_batch_size * prompt_len
+    moe_workspace = tokens * (
+        config.num_experts * 4
+        + config.num_experts_per_tok * (8 + element_size)
+        + 3 * config.moe_intermediate_size * element_size
+        + 3 * config.hidden_size * element_size
+    )
+    if flash_attention:
+        attention_workspace = tokens * config.hidden_size * element_size * 4
+    else:
+        attention_workspace = (
+            gpu_batch_size
+            * config.num_attention_heads
+            * prompt_len
+            * prompt_len
+            * element_size
+        )
+    workspace = max(moe_workspace, attention_workspace)
+    return ResidentMemoryPlan(
+        weights=qwen3_moe_resident_bytes(config, dtype=dtype),
+        memory_kv=memory_kv,
+        gpu_kv=gpu_kv,
+        memory_activations=memory_activations,
+        gpu_activations=gpu_activations,
+        workspace=workspace,
+        staging=qwen3_moe_largest_tensor_bytes(config, dtype=dtype),
+        system_headroom=system_headroom_bytes,
+    )
+
+
+def read_linux_memory_capacity(meminfo_path="/proc/meminfo"):
+    values = {}
+    with open(meminfo_path) as handle:
+        for line in handle:
+            parts = line.split()
+            name = parts[0].rstrip(":")
+            if name not in {"MemAvailable", "MemTotal"}:
+                continue
+            if len(parts) != 3:
+                raise ValueError(f"invalid {name} entry in {meminfo_path}: {line!r}")
+            _, value, unit = parts
+            if unit != "kB":
+                raise ValueError(f"unexpected unit for {name}: {unit}")
+            values[name] = int(value) * 1024
+    try:
+        return values["MemAvailable"], values["MemTotal"]
+    except KeyError as error:
+        raise ValueError(f"missing {error.args[0]} in {meminfo_path}") from error
+
+
+def validate_resident_memory_capacity(
+    plan,
+    available_bytes,
+    total_bytes,
+    cuda_allocator_fraction=0.85,
+):
+    """Reject a resident run that exceeds system or CUDA allocation capacity."""
+    if available_bytes <= 0 or total_bytes <= 0:
+        raise ValueError("memory capacity values must be positive")
+    if not 0 < cuda_allocator_fraction <= 1:
+        raise ValueError("cuda_allocator_fraction must be in (0, 1]")
+    errors = []
+    if plan.system_required > available_bytes:
+        errors.append(
+            f"unified-memory plan requires {plan.system_required / (1024 ** 3):.3f} "
+            f"GiB but MemAvailable is {available_bytes / (1024 ** 3):.3f} GiB"
+        )
+    cuda_limit = int(total_bytes * cuda_allocator_fraction)
+    if plan.cuda_required > cuda_limit:
+        errors.append(
+            f"CUDA allocations require {plan.cuda_required / (1024 ** 3):.3f} "
+            f"GiB but the {cuda_allocator_fraction:.0%} allocator limit is "
+            f"{cuda_limit / (1024 ** 3):.3f} GiB"
+        )
+    if errors:
+        raise MemoryError("resident capacity preflight failed: " + "; ".join(errors))
+    return plan
+
+
 def qwen3_moe_checkpoint_bytes(config, dtype=torch.bfloat16):
     """Return unique checkpoint bytes implied by a Qwen3-MoE config."""
     element_size = torch.empty((), dtype=dtype).element_size()
@@ -367,17 +558,82 @@ def load_qwen3_moe_layer(
     device="cpu",
     dtype=torch.bfloat16,
 ):
-    """Preflight a layer, then stream it into final resident tensors."""
-    expected = qwen3_moe_layer_expected(config, layer_id, dtype=dtype)
-    checkpoint.validate(expected)
+    """Compatibility helper combining the independently owned M1 weights."""
+    fixed = load_qwen3_moe_fixed_weights(
+        checkpoint, config, layer_id, device=device, dtype=dtype
+    )
+    experts = load_qwen3_moe_expert_bank(
+        checkpoint, config, layer_id, device=device, dtype=dtype
+    )
+    return Qwen3MoeLayerWeights(
+        router=fixed.router,
+        post_attention_norm=fixed.post_attention_norm,
+        gate_proj=experts.gate_proj,
+        up_proj=experts.up_proj,
+        down_proj=experts.down_proj,
+    )
+
+
+def load_qwen3_moe_fixed_weights(
+    checkpoint,
+    config,
+    layer_id,
+    device="cpu",
+    dtype=torch.bfloat16,
+):
+    """Load resident router and post-attention norm outside expert storage."""
     spec = get_qwen3_moe_layer_spec(config, layer_id)
+    if spec is None:
+        raise ValueError(f"layer {layer_id} is not a routed Qwen3-MoE layer")
+    hidden = int(config.hidden_size)
+    prefix = f"model.layers.{layer_id}"
+    expected = {
+        f"{prefix}.mlp.gate.weight": ((spec.num_experts, hidden), dtype),
+        f"{prefix}.post_attention_layernorm.weight": ((hidden,), dtype),
+    }
+    checkpoint.validate(expected)
+    fixed = Qwen3MoeFixedWeights(
+        router=torch.empty(
+            (spec.num_experts, hidden), dtype=dtype, device=device
+        ),
+        post_attention_norm=torch.empty((hidden,), dtype=dtype, device=device),
+    )
+    checkpoint.load_into({
+        f"{prefix}.mlp.gate.weight": fixed.router,
+        f"{prefix}.post_attention_layernorm.weight": fixed.post_attention_norm,
+    })
+    return fixed
+
+
+def load_qwen3_moe_expert_bank(
+    checkpoint,
+    config,
+    layer_id,
+    device="cpu",
+    dtype=torch.bfloat16,
+):
+    """Load only the physical expert bank owned by an expert provider."""
+    spec = get_qwen3_moe_layer_spec(config, layer_id)
+    if spec is None:
+        raise ValueError(f"layer {layer_id} is not a routed Qwen3-MoE layer")
     hidden = int(config.hidden_size)
     intermediate = spec.intermediate_size
     num_experts = spec.num_experts
-
-    weights = Qwen3MoeLayerWeights(
-        router=torch.empty((num_experts, hidden), dtype=dtype, device=device),
-        post_attention_norm=torch.empty((hidden,), dtype=dtype, device=device),
+    prefix = f"model.layers.{layer_id}"
+    expected = {}
+    for expert_id in range(num_experts):
+        expert_prefix = f"{prefix}.mlp.experts.{expert_id}"
+        expected[f"{expert_prefix}.gate_proj.weight"] = (
+            (intermediate, hidden), dtype
+        )
+        expected[f"{expert_prefix}.up_proj.weight"] = (
+            (intermediate, hidden), dtype
+        )
+        expected[f"{expert_prefix}.down_proj.weight"] = (
+            (hidden, intermediate), dtype
+        )
+    checkpoint.validate(expected)
+    weights = Qwen3MoeExpertBank(
         gate_proj=torch.empty(
             (num_experts, intermediate, hidden), dtype=dtype, device=device
         ),
@@ -389,11 +645,7 @@ def load_qwen3_moe_layer(
         ),
     )
 
-    prefix = f"model.layers.{layer_id}"
-    destinations = {
-        f"{prefix}.mlp.gate.weight": weights.router,
-        f"{prefix}.post_attention_layernorm.weight": weights.post_attention_norm,
-    }
+    destinations = {}
     for expert_id in range(num_experts):
         expert_prefix = f"{prefix}.mlp.experts.{expert_id}"
         destinations[f"{expert_prefix}.gate_proj.weight"] = weights.gate_proj[

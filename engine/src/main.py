@@ -30,16 +30,20 @@ from model_utils import rms_norm
 import torch.nn.functional as F
 from cache_manager import CacheManager
 from model_adapters import FFNKind, get_ffn_kind, is_qwen3_family
-from moe import ResidentExpertProvider, qwen3_moe_layer_forward
+from moe import ResidentExpertProvider, qwen3_moe_layer_forward_chunked
 from moe_weights import (
 	SafetensorCheckpoint,
 	SafetensorIndex,
-	load_qwen3_moe_layer,
+	load_qwen3_moe_expert_bank,
+	load_qwen3_moe_fixed_weights,
 	qwen3_moe_layer_bytes,
 	qwen3_moe_resident_bytes,
+	estimate_qwen3_moe_resident_memory,
+	read_linux_memory_capacity,
 	tensor_name_from_legacy_np_path,
 	validate_qwen3_moe_checkpoint,
 	validate_qwen3_moe_index,
+	validate_resident_memory_capacity,
 	validate_resident_weight_budget,
 )
 
@@ -96,6 +100,7 @@ class Policy:
 	use_mmap: bool
 	token_group: int
 	att_comp_mode: str
+	moe_token_chunk_size: int
 	
 	@property
 	def w_disk_percent(self):
@@ -447,9 +452,9 @@ class SelfAttention:
 					((self.config.head_dim,), dtype, path + ".self_attn.q_norm.weight"),
 					((self.config.head_dim,), dtype, path + ".self_attn.k_norm.weight"),
 				]
-			weights += init_weight_list(
-				weight_specs, self.policy, self.env, self.config, self.checkpoint
-			)
+				weights += init_weight_list(
+					weight_specs, self.policy, self.env, self.config, self.checkpoint
+				)
 	
 		if self.layer_id > 0 or self.en_pred_emb:
 			if self.lr_proj_mode != 'none' and is_qwen3_family(self.config.model_type):
@@ -982,18 +987,40 @@ class MLP:
 		hidden.val = h
 
 
+class Qwen3ResidentExpertProviderFactory:
+	"""M1 expert storage owner; M2 replaces this with demand materialization."""
+
+	def __init__(self, checkpoint, config):
+		self.checkpoint = checkpoint
+		self.config = config
+
+	def create(self, layer_id, device, dtype):
+		bank = load_qwen3_moe_expert_bank(
+			self.checkpoint,
+			self.config,
+			layer_id,
+			device=device,
+			dtype=dtype,
+		)
+		return ResidentExpertProvider(
+			bank.gate_proj, bank.up_proj, bank.down_proj
+		)
+
+
 class MoEBlock:
 	"""All-resident Qwen3-MoE FFN implementing the existing layer protocol."""
 
-	def __init__(self, config, env, policy, layer_id, checkpoint):
+	def __init__(self, config, env, policy, layer_id, checkpoint,
+				 expert_provider_factory):
 		self.config = config
 		self.env = env
 		self.policy = policy
 		self.layer_id = layer_id
 		self.checkpoint = checkpoint
+		self.expert_provider_factory = expert_provider_factory
 		self.compute = self.env.gpu if self.env.gpu is not None else self.env.cpu
 		self.task = None
-		self.weights = None
+		self.fixed_weights = None
 		self.expert_provider = None
 
 	def set_task(self, task):
@@ -1007,17 +1034,15 @@ class MoEBlock:
 			)
 		if self.env.gpu is None:
 			raise ValueError("M1 MoEBlock requires a CUDA compute device")
-		self.weights = load_qwen3_moe_layer(
+		self.fixed_weights = load_qwen3_moe_fixed_weights(
 			self.checkpoint,
 			self.config,
 			self.layer_id,
 			device=self.compute.dev,
 			dtype=torch.bfloat16,
 		)
-		self.expert_provider = ResidentExpertProvider(
-			self.weights.gate_proj,
-			self.weights.up_proj,
-			self.weights.down_proj,
+		self.expert_provider = self.expert_provider_factory.create(
+			self.layer_id, self.compute.dev, torch.bfloat16
 		)
 		# Resident weights are owned by this layer rather than the legacy
 		# TorchTensor weight movement path.
@@ -1038,18 +1063,20 @@ class MoEBlock:
 	@torch.inference_mode()
 	def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
 				cache_write_buf, i, k):
-		if self.weights is None or self.expert_provider is None:
+		if self.fixed_weights is None or self.expert_provider is None:
 			raise RuntimeError("MoEBlock weights have not been initialized")
 		h = hidden.val
-		output, _ = qwen3_moe_layer_forward(
-			h.data,
-			self.weights.post_attention_norm,
-			self.weights.router,
-			self.expert_provider,
-			top_k=self.config.num_experts_per_tok,
-			norm_topk_prob=self.config.norm_topk_prob,
-			rms_norm_eps=self.config.rms_norm_eps,
-		)
+		with nvtx.annotate(f"moe-layer-{self.layer_id}", color="purple"):
+			output, _ = qwen3_moe_layer_forward_chunked(
+				h.data,
+				self.fixed_weights.post_attention_norm,
+				self.fixed_weights.router,
+				self.expert_provider,
+				top_k=self.config.num_experts_per_tok,
+				norm_topk_prob=self.config.norm_topk_prob,
+				rms_norm_eps=self.config.rms_norm_eps,
+				token_chunk_size=self.policy.moe_token_chunk_size,
+			)
 		h.data = output
 		hidden.val = h
 		
@@ -1093,6 +1120,7 @@ class LM:
 			self.rotary_emb = RotaryEmbedding(config=config, device='cuda:0' if self.env.gpu is not None else 'cpu')
 		
 		self.moe_checkpoint = moe_checkpoint
+		self.expert_provider_factory = None
 		if self.config.model_type == 'qwen3_moe':
 			if self.moe_checkpoint is None:
 				raise ValueError("qwen3_moe requires a preflighted safetensors checkpoint")
@@ -1105,6 +1133,9 @@ class LM:
 				f"Qwen3-MoE resident router/expert/norm bytes: "
 				f"{resident_expert_bytes / GB:.3f} GB",
 				flush=True,
+			)
+			self.expert_provider_factory = Qwen3ResidentExpertProviderFactory(
+				self.moe_checkpoint, self.config
 			)
 
 		layers = []
@@ -1126,7 +1157,8 @@ class LM:
 			self.attn_layer.append(len(layers) - 1)
 			if get_ffn_kind(self.config, i) == FFNKind.ROUTED_MOE:
 				layers.append(MoEBlock(
-					self.config, self.env, self.policy, i, self.moe_checkpoint
+					self.config, self.env, self.policy, i, self.moe_checkpoint,
+					self.expert_provider_factory,
 				))
 			else:
 				layers.append(MLP(
@@ -1807,10 +1839,40 @@ def run_flexgen(args):
 			qwen3_moe_resident_bytes(config, dtype=torch.bfloat16),
 			args.moe_resident_weight_limit_gb * GB,
 		)
+		memory_plan = estimate_qwen3_moe_resident_memory(
+			config=config,
+			gpu_batch_size=args.gpu_batch_size,
+			num_gpu_batches=args.num_gpu_batches,
+			prompt_len=args.prompt_len,
+			gen_len=args.gen_len,
+			cache_gpu_percent=args.percent[2],
+			cache_cpu_percent=args.percent[3],
+			activation_gpu_percent=args.percent[4],
+			activation_cpu_percent=args.percent[5],
+			flash_attention=bool(args.flash_att),
+			system_headroom_bytes=args.moe_system_headroom_gb * GB,
+			dtype=torch.bfloat16,
+		)
+		available_bytes, total_bytes = read_linux_memory_capacity()
+		validate_resident_memory_capacity(
+			memory_plan,
+			available_bytes=available_bytes,
+			total_bytes=total_bytes,
+			cuda_allocator_fraction=0.85,
+		)
 		print(
-			f"Qwen3-MoE checkpoint weight preflight: "
+			f"Qwen3-MoE checkpoint weight approval: "
 			f"{resident_weight_bytes / GB:.3f} GiB within "
 			f"{args.moe_resident_weight_limit_gb:.3f} GiB limit",
+			flush=True,
+		)
+		print(
+			f"Qwen3-MoE capacity preflight: system="
+			f"{memory_plan.system_required / GB:.3f}/{available_bytes / GB:.3f} "
+			f"GiB available, cuda={memory_plan.cuda_required / GB:.3f}/"
+			f"{total_bytes * 0.85 / GB:.3f} GiB allocator limit, "
+			f"staging={memory_plan.staging / GB:.3f} GiB, "
+			f"headroom={memory_plan.system_headroom / GB:.3f} GiB",
 			flush=True,
 		)
 		# Opening every shard and validating shapes is intentionally delayed
@@ -1900,7 +1962,8 @@ def run_flexgen(args):
 					args.reuse_budget,
 	 				args.att_score_mode, args.lr_proj_mode, 
 					bool(args.use_token_cache), batch_split, 
-					args.alpha, bool(args.use_mmap), args.token_group, args.att_comp_mode)
+					args.alpha, bool(args.use_mmap), args.token_group,
+					args.att_comp_mode, args.moe_token_chunk_size)
 
 	cache_size = cache_bytes(config, num_prompts, args.prompt_len + args.gen_len, dtype_size=2)
 	hidden_size = hidden_bytes(config, num_prompts, args.prompt_len + args.gen_len, dtype_size=2)
@@ -2054,9 +2117,21 @@ def add_parser_arguments(parser):
 		type=float,
 		default=0.0,
 		help=(
-			"Explicit weight-only safety limit for fully resident Qwen3-MoE. "
-			"Leave 0 to reject resident MoE execution before allocation."
+			"Explicit user approval limit for fully resident Qwen3-MoE weights; "
+			"this is separate from the system capacity check. Leave 0 to reject."
 		),
+	)
+	parser.add_argument(
+		"--moe_system_headroom_gb",
+		type=float,
+		default=2.0,
+		help="Unified-memory headroom reserved for the OS and untracked runtime use.",
+	)
+	parser.add_argument(
+		"--moe_token_chunk_size",
+		type=int,
+		default=8192,
+		help="Maximum routed-MoE tokens processed at once to bound prefill temporaries.",
 	)
 	
  

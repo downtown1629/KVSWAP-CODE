@@ -2,6 +2,7 @@
 from transformers import AutoConfig
 import numpy as np
 import argparse
+from model_adapters import validate_qwen3_moe_config
 
 def cache_bytes(config, batch_size, seq_len, dtype_size=2, num_layers=None):
     num_layers = config.num_hidden_layers if num_layers is None else num_layers
@@ -22,7 +23,6 @@ def get_model_config(model_path):
         model_config.intermediate_size = config.intermediate_size
         model_config.moe_intermediate_size = config.moe_intermediate_size
         model_config.hidden_act = config.hidden_act
-        assert config.max_position_embeddings >= 32768, f"{config.max_position_embeddings}"
         model_config.max_position_embeddings = config.max_position_embeddings
         model_config.tie_word_embeddings = config.tie_word_embeddings
         model_config.pad_token_id = config.pad_token_id if config.pad_token_id is not None else 151645
@@ -86,4 +86,6 @@ def get_model_config(model_path):
     model_config.scaling = model_config.head_dim ** -0.5
     if hasattr(config, 'rms_norm_eps'):
         model_config.rms_norm_eps = config.rms_norm_eps
+    if model_config.model_type == 'qwen3_moe':
+        validate_qwen3_moe_config(model_config)
     return model_config

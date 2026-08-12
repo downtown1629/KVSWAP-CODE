@@ -59,6 +59,12 @@ class ExpertProvider(Protocol):
         ...
 
 
+class ExpertProviderFactory(Protocol):
+    def create(self, layer_id, device, dtype):
+        """Create the provider that owns expert storage for one routed layer."""
+        ...
+
+
 class ResidentExpertProvider:
     """Expose an all-resident expert bank without copying selected weights."""
 
@@ -180,3 +186,51 @@ def qwen3_moe_layer_forward(
         norm_topk_prob,
     )
     return residual + moe_output, routing
+
+
+def qwen3_moe_layer_forward_chunked(
+    hidden_states,
+    post_attention_norm,
+    router_weight,
+    expert_provider: ExpertProvider,
+    top_k,
+    norm_topk_prob,
+    rms_norm_eps,
+    token_chunk_size,
+):
+    """Bound prefill temporaries while preserving token-independent semantics."""
+    if token_chunk_size <= 0:
+        raise ValueError("token_chunk_size must be positive")
+    original_shape = hidden_states.shape
+    flat_hidden = hidden_states.reshape(-1, original_shape[-1])
+    if flat_hidden.shape[0] <= token_chunk_size:
+        return qwen3_moe_layer_forward(
+            hidden_states,
+            post_attention_norm,
+            router_weight,
+            expert_provider,
+            top_k,
+            norm_topk_prob,
+            rms_norm_eps,
+        )
+
+    outputs = []
+    routings = []
+    for start in range(0, flat_hidden.shape[0], token_chunk_size):
+        output, routing = qwen3_moe_layer_forward(
+            flat_hidden[start : start + token_chunk_size],
+            post_attention_norm,
+            router_weight,
+            expert_provider,
+            top_k,
+            norm_topk_prob,
+            rms_norm_eps,
+        )
+        outputs.append(output)
+        routings.append(routing)
+    routing = RoutingResult(
+        router_logits=torch.cat([item.router_logits for item in routings]),
+        topk_ids=torch.cat([item.topk_ids for item in routings]),
+        topk_weights=torch.cat([item.topk_weights for item in routings]),
+    )
+    return torch.cat(outputs).reshape(original_shape), routing

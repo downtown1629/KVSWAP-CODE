@@ -160,8 +160,9 @@ Qwen3-MoE attention은 dense Qwen3와 같은 q/k norm 및 rotary 처리를 사�
 cd engine
 PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_moe_*.py'
 bash scripts/eval_moe_m1.sh fixture-fullkv
-bash scripts/eval_moe_m1.sh fixture-kvswap
-bash scripts/eval_moe_m1.sh real-parity   # large-memory server only
+# Planned gates; these modes are not implemented yet:
+# bash scripts/eval_moe_m1.sh fixture-kvswap
+# bash scripts/eval_moe_m1.sh real-parity  # large-memory server only
 ```
 
 권장 테스트 파일:
@@ -207,14 +208,14 @@ MEMORY_ALLOC: object=router|expert|workspace, layer, bytes, dtype
 
 - [x] canonical Qwen3-MoE config와 mixed dense/MoE schedule을 읽는다.
 - [x] 모든 router/expert weight가 lossless하게 매핑되고 resident memory에 한 번만 존재한다.
-- [x] tiny fixture의 prefill과 decode에서 router top-k ID가 reference와 모두 일치한다.
+- [x] isolated tiny fixture의 prefill/decode shape matrix에서 router top-k ID가 reference와 일치한다.
 - [x] tiny fixture의 aggregate MoE output이 reference와 일치한다.
-- [x] full-KV fixture의 short greedy output이 HF reference와 일치한다.
+- [x] full-KV fixture의 2-token greedy output이 HF reference와 일치하고 두 번 반복해 동일하다.
 - [ ] 실제 checkpoint의 short greedy output이 HF reference와 일치한다.
 - [ ] KVSwap KV 경로와 resident MoE가 함께 실행된다.
 - [ ] 기존 dense Qwen3 smoke test에 기능 회귀가 없다.
 - [x] expert I/O/cache/prefetch 코드가 M1에 섞이지 않았다.
-- [x] memory estimate, peak usage와 재현 명령이 보존되었다.
+- [x] shard open 전 resident capacity estimate와 fixture peak usage 및 재현 명령이 보존되었다.
 
 모든 항목을 통과해야 Qwen3-MoE M1을 완료한 것으로 본다. 다음 우선순위는 Qwen3-MoE의 실제 Jetson synchronous demand loading(M2)이며, 가능하면 bounded cache(M3)까지 vertical slice를 확보한 뒤 아래 architecture 확장을 시작한다. 추가 모델에는 각자의 resident-parity gate를 통과하기 전 expert offloading을 활성화하지 않는다.
 

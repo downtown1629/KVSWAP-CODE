@@ -10,7 +10,11 @@ from safetensors.torch import save_file
 from moe_weights import (
     SafetensorCheckpoint,
     SafetensorIndex,
+    ResidentMemoryPlan,
+    estimate_qwen3_moe_resident_memory,
     load_qwen3_moe_layer,
+    load_qwen3_moe_expert_bank,
+    load_qwen3_moe_fixed_weights,
     qwen3_moe_checkpoint_bytes,
     qwen3_moe_layer_bytes,
     qwen3_moe_layer_expected,
@@ -19,11 +23,25 @@ from moe_weights import (
     tensor_name_from_legacy_np_path,
     validate_qwen3_moe_checkpoint,
     validate_qwen3_moe_index,
+    read_linux_memory_capacity,
+    validate_resident_memory_capacity,
     validate_resident_weight_budget,
 )
 
 
 class Qwen3MoeWeightsTest(unittest.TestCase):
+    def test_meminfo_parser_ignores_unitless_unrelated_entries(self):
+        with tempfile.NamedTemporaryFile(mode="w") as handle:
+            handle.write(
+                "MemTotal:       8192000 kB\n"
+                "MemAvailable:   4096000 kB\n"
+                "HugePages_Total:       0\n"
+            )
+            handle.flush()
+            available, total = read_linux_memory_capacity(handle.name)
+        self.assertEqual(available, 4096000 * 1024)
+        self.assertEqual(total, 8192000 * 1024)
+
     def setUp(self):
         self.config = SimpleNamespace(
             model_type="qwen3_moe",
@@ -120,6 +138,22 @@ class Qwen3MoeWeightsTest(unittest.TestCase):
                 expected_tensors[f"{prefix}.down_proj.weight"],
             )
 
+    def test_fixed_weights_and_expert_bank_have_separate_ownership(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            expected_tensors = self.make_checkpoint(tmp)
+            checkpoint = SafetensorCheckpoint(tmp)
+            fixed = load_qwen3_moe_fixed_weights(checkpoint, self.config, 0)
+            experts = load_qwen3_moe_expert_bank(checkpoint, self.config, 0)
+        torch.testing.assert_close(
+            fixed.router, expected_tensors["model.layers.0.mlp.gate.weight"]
+        )
+        torch.testing.assert_close(
+            fixed.post_attention_norm,
+            expected_tensors["model.layers.0.post_attention_layernorm.weight"],
+        )
+        self.assertEqual(experts.gate_proj.shape[0], self.config.num_experts)
+        self.assertFalse(hasattr(experts, "router"))
+
     def test_index_only_preflight_does_not_require_weight_shards(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.make_checkpoint(tmp)
@@ -187,6 +221,52 @@ class Qwen3MoeWeightsTest(unittest.TestCase):
                     checkpoint.total_tensor_bytes,
                 ),
                 checkpoint.total_tensor_bytes,
+            )
+
+    def test_capacity_gate_accounts_for_staging_and_headroom(self):
+        plan = estimate_qwen3_moe_resident_memory(
+            self.config,
+            gpu_batch_size=1,
+            num_gpu_batches=1,
+            prompt_len=64,
+            gen_len=2,
+            cache_gpu_percent=100,
+            cache_cpu_percent=0,
+            activation_gpu_percent=100,
+            activation_cpu_percent=0,
+            flash_attention=False,
+            system_headroom_bytes=1024,
+        )
+        self.assertGreater(plan.staging, 0)
+        self.assertGreaterEqual(plan.system_required, plan.cuda_required)
+        self.assertEqual(plan.system_headroom, 1024)
+        self.assertIs(
+            validate_resident_memory_capacity(
+                plan,
+                available_bytes=plan.system_required,
+                total_bytes=plan.cuda_required * 2,
+            ),
+            plan,
+        )
+
+    def test_capacity_gate_rejects_system_and_allocator_shortfall(self):
+        plan = ResidentMemoryPlan(
+            weights=100,
+            memory_kv=20,
+            gpu_kv=20,
+            memory_activations=10,
+            gpu_activations=10,
+            workspace=10,
+            staging=30,
+            system_headroom=40,
+        )
+        with self.assertRaisesRegex(MemoryError, "MemAvailable"):
+            validate_resident_memory_capacity(
+                plan, available_bytes=plan.system_required - 1, total_bytes=1000
+            )
+        with self.assertRaisesRegex(MemoryError, "allocator limit"):
+            validate_resident_memory_capacity(
+                plan, available_bytes=1000, total_bytes=100, cuda_allocator_fraction=0.5
             )
 
     def test_tied_embeddings_still_account_for_two_engine_buffers(self):

@@ -9,6 +9,7 @@ from model_adapters import (
     get_ffn_kind,
     get_qwen3_moe_layer_spec,
     is_qwen3_family,
+    validate_qwen3_moe_config,
 )
 from model_config import get_model_config
 
@@ -24,6 +25,14 @@ class Qwen3MoeAdapterTest(unittest.TestCase):
             norm_topk_prob=True,
             decoder_sparse_step=2,
             mlp_only_layers=[3],
+            hidden_size=64,
+            head_dim=16,
+            num_attention_heads=4,
+            num_kv_heads=2,
+            intermediate_size=128,
+            vocab_size=128,
+            max_position_embeddings=32768,
+            rms_norm_eps=1e-6,
         )
 
     def test_qwen3_family(self):
@@ -80,6 +89,39 @@ class Qwen3MoeAdapterTest(unittest.TestCase):
         self.assertEqual(config.num_experts, 8)
         self.assertEqual(config.num_experts_per_tok, 2)
         self.assertEqual(config.rms_norm_eps, 1e-6)
+
+    def test_config_validation_rejects_invalid_shape_and_schedule(self):
+        config = self.make_config()
+        self.assertIs(validate_qwen3_moe_config(config), config)
+
+        invalid_heads = SimpleNamespace(**vars(config))
+        invalid_heads.num_kv_heads = 3
+        with self.assertRaisesRegex(ValueError, "divisible"):
+            validate_qwen3_moe_config(invalid_heads)
+
+        invalid_layer = SimpleNamespace(**vars(config))
+        invalid_layer.mlp_only_layers = [4]
+        with self.assertRaisesRegex(ValueError, "invalid layer"):
+            validate_qwen3_moe_config(invalid_layer)
+
+        no_routed_layer = SimpleNamespace(**vars(config))
+        no_routed_layer.mlp_only_layers = [1, 3]
+        with self.assertRaisesRegex(ValueError, "does not contain"):
+            validate_qwen3_moe_config(no_routed_layer)
+
+    def test_config_validation_rejects_invalid_scalar_fields(self):
+        for field, value in (
+            ("num_experts", 0),
+            ("num_experts_per_tok", 9),
+            ("moe_intermediate_size", -1),
+            ("rms_norm_eps", 0),
+            ("norm_topk_prob", 1),
+        ):
+            config = SimpleNamespace(**vars(self.make_config()))
+            setattr(config, field, value)
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError):
+                    validate_qwen3_moe_config(config)
 
 
 if __name__ == "__main__":

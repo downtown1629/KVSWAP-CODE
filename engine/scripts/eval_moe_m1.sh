@@ -32,15 +32,29 @@ case "$MODE" in
         free -h
         make_fixture
         OFFLOAD_DIR=$(mktemp -d /tmp/kvswap-qwen3-moe-offload.XXXXXX)
-        MAX_ALLOC_KV_SIZE=67108864 "$PYTHON" src/main.py \
-            --model_path "$FIXTURE_DIR" --offload_dir "$OFFLOAD_DIR" \
-            --prompt_len 64 --gen_len 2 --gpu_batch_size 1 \
-            --num_gpu_batches 1 --percent 100 0 100 0 100 0 \
-            --test_input_path ./data/test_inputs --run_args L0 \
-            --lr_proj_mode none --use_token_cache 0 --dk_wr none \
-            --dk_rd none --token_group 1 --disk_dev_name nvme \
-            --batch_split 1 --seed 1234 --flash_att 0 --paged_att 0 \
-            --moe_resident_weight_limit_gb 0.01 --nv_profile 0
+        run_fixture_engine() {
+            local run_log=$1
+            MAX_ALLOC_KV_SIZE=67108864 "$PYTHON" src/main.py \
+                --model_path "$FIXTURE_DIR" --offload_dir "$OFFLOAD_DIR" \
+                --prompt_len 64 --gen_len 2 --gpu_batch_size 1 \
+                --num_gpu_batches 1 --percent 100 0 100 0 100 0 \
+                --test_input_path ./data/test_inputs --run_args L0 \
+                --lr_proj_mode none --use_token_cache 0 --dk_wr none \
+                --dk_rd none --token_group 1 --disk_dev_name nvme \
+                --batch_split 1 --seed 1234 --flash_att 0 --paged_att 0 \
+                --moe_resident_weight_limit_gb 0.01 --nv_profile 0 \
+                >"$run_log" 2>&1
+            cat "$run_log"
+            grep -Fqx "0: token_99 token_8" "$run_log"
+        }
+        RUN_LOG_1=$(mktemp /tmp/kvswap-qwen3-moe-run1.XXXXXX)
+        RUN_LOG_2=$(mktemp /tmp/kvswap-qwen3-moe-run2.XXXXXX)
+        run_fixture_engine "$RUN_LOG_1"
+        run_fixture_engine "$RUN_LOG_2"
+        OUTPUT_1=$(grep -Fx "0: token_99 token_8" "$RUN_LOG_1" | head -1)
+        OUTPUT_2=$(grep -Fx "0: token_99 token_8" "$RUN_LOG_2" | head -1)
+        test "$OUTPUT_1" = "$OUTPUT_2"
+        echo "HF fixture parity and repeat determinism: $OUTPUT_1"
         echo "offload directory: $OFFLOAD_DIR"
         ;;
     *)
