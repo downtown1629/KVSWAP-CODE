@@ -30,7 +30,8 @@ def lr_kcache_func(lr_proj_mode, lr_k, key, pos, kv_heads, kv_groups, partial_in
 
 @torch.inference_mode()
 def speculate_attention(lr_proj_mode, hidden, next_partial_wq, next_skew_matrix, next_qproj, next_qnorm, next_lr_k_proj, next_lr_kcache, pos_emb, next_partial_idx,
-						scaling, n_head, kv_rep, alpha, max_num_kv, token_group, score_mode):
+						scaling, n_head, kv_rep, alpha, max_num_kv, token_group, score_mode,
+						rms_norm_eps=1e-5):
 		
 	b = hidden.shape[0]
 	dtype = hidden.dtype
@@ -39,7 +40,7 @@ def speculate_attention(lr_proj_mode, hidden, next_partial_wq, next_skew_matrix,
 		query = F.linear(hidden, next_partial_wq.to(dtype), bias=None) # b, 1, h*d'
 		query = query.view(b, 1, n_head, -1) # b, 1, h, d'
 		if next_qnorm is not None:
-			query = rms_norm(query, next_qnorm.data.to(dtype))
+			query = rms_norm(query, next_qnorm.data.to(dtype), eps=rms_norm_eps)
 		if pos_emb is not None:
 			query, _ = apply_rotary_pos_emb(query, None, *pos_emb, layout='bshd') # b, 1, h, d'
 			# partial_idx: h, d' -> 1, 1, h, d' -> b, 1, h, d'
@@ -65,7 +66,7 @@ def speculate_attention(lr_proj_mode, hidden, next_partial_wq, next_skew_matrix,
 		query = F.linear(hidden, next_qproj.to(dtype), bias=None) # b, 1, h*d
 		query = query.view(b, 1, n_head, -1) # b, 1, h, d
 		if next_qnorm is not None:
-			query = rms_norm(query, next_qnorm.data.to(dtype))
+			query = rms_norm(query, next_qnorm.data.to(dtype), eps=rms_norm_eps)
 		if pos_emb is not None: # pre processing query
 			query, _ = apply_rotary_pos_emb(query, None, *pos_emb, layout='bshd') # b, 1, h, d
 		if lr_proj_mode == 'lr_proj_sh':
@@ -135,4 +136,3 @@ def get_partial_q_weight(weight, partial_idx, num_heads, head_dim):
 	din = weight.shape[-1]
 	weight = weight.view(num_heads, head_dim, din).gather(1, partial_idx.unsqueeze(-1).expand(-1, -1, din))
 	return weight.view(-1, din)
-

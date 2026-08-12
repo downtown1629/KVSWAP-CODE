@@ -12,7 +12,6 @@ import gc
 from tqdm import tqdm
 # from datasets import load_dataset
 import random
-torch.cuda.set_per_process_memory_fraction(0.85, device=0)
 random.seed(1234)
 torch.manual_seed(1234)
 np.random.seed(1234)
@@ -30,6 +29,19 @@ from methods import merge_qk_weight, get_partial_q_weight, speculate_attention, 
 from model_utils import rms_norm
 import torch.nn.functional as F
 from cache_manager import CacheManager
+from model_adapters import FFNKind, get_ffn_kind, is_qwen3_family
+from moe import ResidentExpertProvider, qwen3_moe_layer_forward
+from moe_weights import (
+	SafetensorCheckpoint,
+	SafetensorIndex,
+	load_qwen3_moe_layer,
+	qwen3_moe_layer_bytes,
+	qwen3_moe_resident_bytes,
+	tensor_name_from_legacy_np_path,
+	validate_qwen3_moe_checkpoint,
+	validate_qwen3_moe_index,
+	validate_resident_weight_budget,
+)
 
 fix_recursive_import()
 
@@ -108,12 +120,16 @@ def get_choice(cur_percent, percents, choices):
 	return choices[-1]
 
 
-def init_weight_list(weight_specs, policy, env, config):
+def init_weight_list(weight_specs, policy, env, config, checkpoint=None):
 	dev_percents = [policy.w_disk_percent, policy.w_cpu_percent, policy.w_gpu_percent]
 	dev_choices = [env.disk, env.cpu, env.gpu]
 	sizes = [np.prod(spec[0]) for spec in weight_specs]
 	sizes_cumsum = np.cumsum(sizes)
 	ret = []
+	direct_destinations = {}
+	direct_safetensors = config.model_type == 'qwen3_moe'
+	if direct_safetensors and checkpoint is None:
+		raise ValueError("qwen3_moe requires a preflighted weight checkpoint")
 	for i in range(len(weight_specs)):
 		mid_percent = (sizes_cumsum[i] - sizes[i] / 2) / sizes_cumsum[-1]
 		home = get_choice(mid_percent * 100, dev_percents, dev_choices)
@@ -125,23 +141,35 @@ def init_weight_list(weight_specs, policy, env, config):
 		else:
 			pin_memory = policy.pin_weight
 		if not compress:
-			weight = home.allocate(shape, dtype, pin_memory=pin_memory)
-			weight.load_from_np_file(weight_specs[i][2])
+			weight = home.allocate(
+				shape,
+				dtype,
+				pin_memory=pin_memory,
+				force_bf16=direct_safetensors and dtype == np.float16,
+			)
+			if direct_safetensors:
+				tensor_name = tensor_name_from_legacy_np_path(weight_specs[i][2])
+				direct_destinations[tensor_name] = weight.data
+			else:
+				weight.load_from_np_file(weight_specs[i][2])
 		else:
 			weight = home.compressed_device.allocate(
 				shape, dtype, policy.comp_weight_config, pin_memory=pin_memory)
 			weight.load_from_np_file(weight_specs[i][2])
-		if config.model_type in ('qwen2', 'qwen3') and config.dtype == np.float16:
+		if not direct_safetensors and (config.model_type == 'qwen2' or is_qwen3_family(config.model_type)) and config.dtype == np.float16:
 			weight.data = weight.data.to(torch.bfloat16)
 		ret.append(weight)
+	if direct_destinations:
+		checkpoint.load_into(direct_destinations)
 	return ret
 
 
 class InputEmbed:
-	def __init__(self, config, env, policy):
+	def __init__(self, config, env, policy, checkpoint=None):
 		self.config = config
 		self.env = env
 		self.policy = policy
+		self.checkpoint = checkpoint
 		self.compute = self.env.gpu if self.env.gpu is not None else self.env.cpu
 		self.weight_load_dst = self.compute
 		self.task = None
@@ -162,7 +190,9 @@ class InputEmbed:
 			weight_specs = [
 				((v, h), dtype, path + "model.embed_tokens.weight"),
 			]           
-		weights = init_weight_list(weight_specs, self.policy, self.env, self.config)
+		weights = init_weight_list(
+			weight_specs, self.policy, self.env, self.config, self.checkpoint
+		)
 		weight_home.store(weights)
 
 	def load_weight(self, weight_home, weight_read_buf, k):
@@ -222,10 +252,11 @@ class InputEmbed:
 		
 
 class OutputEmbed:
-	def __init__(self, config, env, policy):
+	def __init__(self, config, env, policy, checkpoint=None):
 		self.config = config
 		self.env = env
 		self.policy = policy
+		self.checkpoint = checkpoint
 		self.compute = self.env.gpu if self.env.gpu is not None else self.env.cpu
 		self.weight_load_dst = self.compute
 		self.task = None
@@ -248,7 +279,9 @@ class OutputEmbed:
 				((h,), dtype, path + "model.norm.weight"),
 				((v, h), dtype, path + "model.embed_tokens.weight" if self.config.tie_word_embeddings else path + "lm_head.weight")
 			]
-		weights = init_weight_list(weight_specs, self.policy, self.env, self.config)
+		weights = init_weight_list(
+			weight_specs, self.policy, self.env, self.config, self.checkpoint
+		)
 		weight_home.store(weights)
 
 	def load_weight(self, weight_home, weight_read_buf, k):
@@ -284,7 +317,11 @@ class OutputEmbed:
 		else:
 			(w_ln, _), (b_ln, _), (w_token, _) = weight_read_buf.val
 	
-		h = self.compute.output_embed(h, w_ln, b_ln, w_token, donate, self.task.do_sample, self.task.temperature)        
+		h = self.compute.output_embed(
+			h, w_ln, b_ln, w_token, donate,
+			self.task.do_sample, self.task.temperature,
+			rms_norm_eps=getattr(self.config, 'rms_norm_eps', 1e-5),
+		)
 		hidden.val = h
 
 
@@ -292,12 +329,13 @@ prefetch_kv_buf = None
 cache_manager_inst = None
 
 class SelfAttention:
-	def __init__(self, config, env, policy, layer_id, 
-				 skew_paths, lr_proj_path, enable_pred):
+	def __init__(self, config, env, policy, layer_id,
+				 skew_paths, lr_proj_path, enable_pred, checkpoint=None):
 		self.config = config
 		self.env = env
 		self.layer_id = layer_id
 		self.policy = policy
+		self.checkpoint = checkpoint
 		self.compute = self.env.gpu if self.env.gpu is not None else self.env.cpu
 		self.weight_load_dst = self.compute
 		self.attention_compute = self.compute
@@ -326,7 +364,7 @@ class SelfAttention:
 				self.partial_index = torch.load(skew_partial_idx_path+f'/{layer_id}.pt', 
 												map_location=self.compute.dev).to(torch.long)
 			elif self.lr_proj_mode.startswith('lr_proj'):
-				dtype = torch.bfloat16 if self.config.model_type in ('qwen2', 'qwen3') and self.config.dtype == np.float16 else torch.float16
+				dtype = torch.bfloat16 if (self.config.model_type == 'qwen2' or is_qwen3_family(self.config.model_type)) and self.config.dtype == np.float16 else torch.float16
 				self.lr_kproj = torch.load(lr_proj_path+f'/lr_kproj_{layer_id}.pt', map_location=self.compute.dev).to(dtype)
 
 	def set_task(self, task):
@@ -362,7 +400,9 @@ class SelfAttention:
 				((h,), dtype, path + "_layer_norm.weight"),
 				((h,), dtype, path + "_layer_norm.bias"),
 			]
-			weights = init_weight_list(weight_specs, self.policy, self.env, self.config)
+			weights = init_weight_list(
+				weight_specs, self.policy, self.env, self.config, self.checkpoint
+			)
 			weights[0].data = torch.cat((weights[0].data, weights[1].data.unsqueeze(1).to(weights[0].data.device)), dim=1)
 			weights[0].shape = (h, h+1)
 			weights[2].data = torch.cat((weights[2].data, weights[3].data.unsqueeze(1).to(weights[2].data.device)), dim=1)
@@ -383,7 +423,9 @@ class SelfAttention:
 					# ((h,), dtype, path + ".self_attn.o_proj.bias"), # qwen doesn't have o_proj.bias
 					((h,), dtype, path + ".input_layernorm.weight"),
 				]
-				weights = init_weight_list(weight_specs, self.policy, self.env, self.config)
+				weights = init_weight_list(
+					weight_specs, self.policy, self.env, self.config, self.checkpoint
+				)
 				weights[0].data = torch.cat((weights[0].data, weights[1].data.unsqueeze(1).to(weights[0].data.device)), dim=1)
 				weights[0].shape = (h, h+1)
 				weights[2].data = torch.cat((weights[2].data, weights[3].data.unsqueeze(1).to(weights[2].data.device)), dim=1)
@@ -396,17 +438,21 @@ class SelfAttention:
 					((h, hq), dtype, path + ".self_attn.o_proj.weight"),
 					((h,), dtype, path + ".input_layernorm.weight"),
 				]     
-				weights = init_weight_list(weight_specs, self.policy, self.env, self.config)
+				weights = init_weight_list(
+					weight_specs, self.policy, self.env, self.config, self.checkpoint
+				)
 	
-			if self.config.model_type == 'qwen3':
+			if is_qwen3_family(self.config.model_type):
 				weight_specs = [
 					((self.config.head_dim,), dtype, path + ".self_attn.q_norm.weight"),
 					((self.config.head_dim,), dtype, path + ".self_attn.k_norm.weight"),
 				]
-				weights += init_weight_list(weight_specs, self.policy, self.env, self.config)
+			weights += init_weight_list(
+				weight_specs, self.policy, self.env, self.config, self.checkpoint
+			)
 	
 		if self.layer_id > 0 or self.en_pred_emb:
-			if self.lr_proj_mode != 'none' and self.config.model_type == 'qwen3':
+			if self.lr_proj_mode != 'none' and is_qwen3_family(self.config.model_type):
 				self.qnorm = weights[-2].data
 	  
 			if self.lr_proj_mode == 'base':
@@ -466,7 +512,7 @@ class SelfAttention:
 								w_norm.smart_copy(dst2), (None, None),
 								(None, None), (None, None))
 			else:     
-				if self.config.model_type == 'qwen3':
+				if is_qwen3_family(self.config.model_type):
 					w_q, w_k, w_v, w_out, w_norm, q_norm, k_norm = weight_home.val
 					if CONCAT_PROJ_WEIGHT:
 						raise NotImplementedError()
@@ -513,7 +559,7 @@ class SelfAttention:
 			elif self.policy.use_token_cache:
 				return
 		
-		force_bf16 = self.config.model_type in ('qwen2', 'qwen3') and self.config.dtype == np.float16
+		force_bf16 = (self.config.model_type == 'qwen2' or is_qwen3_family(self.config.model_type)) and self.config.dtype == np.float16
 		if '0' in self.policy.start_layer:
 			if 'emb' in self.policy.start_layer:
 				start_layer = -1
@@ -663,13 +709,21 @@ class SelfAttention:
 			if i == 0:
 				indices = (slice(0, k_new.shape[0]),
 							slice(0, k_new.shape[1]))    
-				# (b, s, hd) (b, s, hd) -> (b, s, 2hd)
-				general_copy(kv_home, indices, (k_new, v_new), None, key='store_kv')
 			else:
 				indices = (slice(0, k_new.shape[0]), 
 						   slice(self.task.prompt_len + i - 1, self.task.prompt_len + i))
-				# (b, 1, hd) (b, 1, hd) -> (b, 1, 2hd)
-				general_copy(kv_home, indices, (k_new.reshape(k_new.shape[0], 1, -1), v_new.reshape(v_new.shape[0], 1, -1)), None, key='store_kv')
+				k_new = k_new.reshape(k_new.shape[0], 1, -1)
+				v_new = v_new.reshape(v_new.shape[0], 1, -1)
+			# (b, s, hd) (b, s, hd) -> (b, s, 2hd)
+			if kv_home.device.device_type == DeviceType.DISK:
+				general_copy(
+					kv_home, indices, (k_new, v_new), None, key='store_kv'
+				)
+			else:
+				destination = kv_home.data[indices]
+				hidden_width = k_new.shape[-1]
+				destination[..., :hidden_width].copy_(k_new)
+				destination[..., hidden_width:].copy_(v_new)
 			return 
 
 
@@ -772,7 +826,8 @@ class SelfAttention:
 															self.config.num_kv_groups, pos_emb, 
 															self.lr_proj_mode,
 															donate, self.policy.compress_cache, self.policy.comp_cache_config, 
-															self.policy.flash_att, self.chunk_size)
+																	self.policy.flash_att, self.chunk_size,
+																	rms_norm_eps=getattr(self.config, 'rms_norm_eps', 1e-5))
 						
 			if not (self.policy.use_token_cache and self.layer_id == 0):
 				cache_write_buf.store((new_k_cache, new_v_cache))
@@ -807,7 +862,8 @@ class SelfAttention:
 																self.policy.compress_cache, self.policy.comp_cache_config, 
 																spec_stream, prefetch_event, prefetch_sync,
 																self.policy.alpha, self.policy.max_num_kv, 
-																self.policy.att_score_mode, att_comp_mode=self.policy.att_comp_mode)
+																self.policy.att_score_mode, att_comp_mode=self.policy.att_comp_mode,
+																rms_norm_eps=getattr(self.config, 'rms_norm_eps', 1e-5))
 			
 			if self.lr_k is None and not (self.policy.use_token_cache and self.layer_id == 0):
 				cache_write_buf.store((new_k_cache, new_v_cache))
@@ -816,11 +872,12 @@ class SelfAttention:
 	
 
 class MLP:
-	def __init__(self, config, env, policy, layer_id):
+	def __init__(self, config, env, policy, layer_id, checkpoint=None):
 		self.config = config
 		self.env = env
 		self.layer_id = layer_id
 		self.policy = policy
+		self.checkpoint = checkpoint
 		self.compute = self.env.gpu if self.env.gpu is not None else self.env.cpu
 		self.weight_load_dst = self.compute
 		self.task = None
@@ -860,7 +917,9 @@ class MLP:
 				((h, intermediate_size), dtype, path + "mlp.down_proj.weight"),
 				((h,), dtype, path + "post_attention_layernorm.weight"),
 			]            
-		weights = init_weight_list(weight_specs, self.policy, self.env, self.config)
+		weights = init_weight_list(
+			weight_specs, self.policy, self.env, self.config, self.checkpoint
+		)
 		weight_home.store(weights)
 
 	def load_weight(self, weight_home, weight_read_buf, k):
@@ -912,9 +971,86 @@ class MLP:
 			
 			if i == 0:
 				h = self.compute.llama_mlp(h, w_gate, w_up, w_down, w_norm, donate, 
-							   act=self.config.hidden_act, chunk_size=self.chunk_size)      
+							   act=self.config.hidden_act, chunk_size=self.chunk_size,
+							   rms_norm_eps=getattr(self.config, 'rms_norm_eps', 1e-5))
 			else:
-				h = self.compute.llama_mlp_gen(h, w_gate, w_up, w_down, w_norm, donate, act=self.config.hidden_act)   
+				h = self.compute.llama_mlp_gen(
+					h, w_gate, w_up, w_down, w_norm, donate,
+					act=self.config.hidden_act,
+					rms_norm_eps=getattr(self.config, 'rms_norm_eps', 1e-5),
+				)
+		hidden.val = h
+
+
+class MoEBlock:
+	"""All-resident Qwen3-MoE FFN implementing the existing layer protocol."""
+
+	def __init__(self, config, env, policy, layer_id, checkpoint):
+		self.config = config
+		self.env = env
+		self.policy = policy
+		self.layer_id = layer_id
+		self.checkpoint = checkpoint
+		self.compute = self.env.gpu if self.env.gpu is not None else self.env.cpu
+		self.task = None
+		self.weights = None
+		self.expert_provider = None
+
+	def set_task(self, task):
+		self.task = task
+
+	def init_weight(self, weight_home, path):
+		if self.policy.w_gpu_percent != 100 or self.policy.w_cpu_percent != 0:
+			raise ValueError(
+				"M1 MoEBlock requires fully resident weights; use 100/0 GPU/CPU "
+				"weight percentages"
+			)
+		if self.env.gpu is None:
+			raise ValueError("M1 MoEBlock requires a CUDA compute device")
+		self.weights = load_qwen3_moe_layer(
+			self.checkpoint,
+			self.config,
+			self.layer_id,
+			device=self.compute.dev,
+			dtype=torch.bfloat16,
+		)
+		self.expert_provider = ResidentExpertProvider(
+			self.weights.gate_proj,
+			self.weights.up_proj,
+			self.weights.down_proj,
+		)
+		# Resident weights are owned by this layer rather than the legacy
+		# TorchTensor weight movement path.
+		weight_home.store([])
+
+	def load_weight(self, weight_home, weight_read_buf, k):
+		pass
+
+	def init_cache_one_gpu_batch(self, cache_home):
+		pass
+
+	def load_cache(self, cache_home, cache_read_buf, i):
+		pass
+
+	def store_cache(self, cache_home, cache_write_buf, i):
+		pass
+
+	@torch.inference_mode()
+	def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
+				cache_write_buf, i, k):
+		if self.weights is None or self.expert_provider is None:
+			raise RuntimeError("MoEBlock weights have not been initialized")
+		h = hidden.val
+		output, _ = qwen3_moe_layer_forward(
+			h.data,
+			self.weights.post_attention_norm,
+			self.weights.router,
+			self.expert_provider,
+			top_k=self.config.num_experts_per_tok,
+			norm_topk_prob=self.config.norm_topk_prob,
+			rms_norm_eps=self.config.rms_norm_eps,
+		)
+		h.data = output
 		hidden.val = h
 		
 
@@ -925,7 +1061,8 @@ class LM:
 				 model_path: str,
 				 policy: Policy, 
 				 skew_paths, 
-				 lr_proj_path
+				 lr_proj_path,
+				 moe_checkpoint=None,
 				 ):
 		self.config = config
 		self.env = env
@@ -946,6 +1083,8 @@ class LM:
 		if self.config.model_type != 'opt':
 			if self.config.model_type == 'llama3':
 				from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding as RotaryEmbedding
+			elif self.config.model_type == 'qwen3_moe':
+				from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRotaryEmbedding as RotaryEmbedding
 			else:
 				from transformers.models.qwen2.modeling_qwen2 import Qwen2RotaryEmbedding as RotaryEmbedding
 			# self.rotary_emb = RotaryEmbedding(dim=config.head_dim, 
@@ -953,21 +1092,50 @@ class LM:
 											#   base=config.rope_base, scaling_factor=1.0, device='cuda:0' if self.env.gpu is not None else 'cpu')
 			self.rotary_emb = RotaryEmbedding(config=config, device='cuda:0' if self.env.gpu is not None else 'cpu')
 		
+		self.moe_checkpoint = moe_checkpoint
+		if self.config.model_type == 'qwen3_moe':
+			if self.moe_checkpoint is None:
+				raise ValueError("qwen3_moe requires a preflighted safetensors checkpoint")
+			resident_expert_bytes = sum(
+				qwen3_moe_layer_bytes(self.config, layer_id)
+				for layer_id in range(self.config.num_hidden_layers)
+				if get_ffn_kind(self.config, layer_id) == FFNKind.ROUTED_MOE
+			)
+			print(
+				f"Qwen3-MoE resident router/expert/norm bytes: "
+				f"{resident_expert_bytes / GB:.3f} GB",
+				flush=True,
+			)
+
 		layers = []
 		self.attn_layer = []		
   
-		layers.append(InputEmbed(self.config, self.env, self.policy))
+		layers.append(InputEmbed(
+			self.config, self.env, self.policy, self.moe_checkpoint
+		))
   
 		for i in range(self.config.num_hidden_layers):
 			if i == 0:
 				enable_pred = self.start_prefetch_layer <= 0 and not self.use_cur_hidden_forl0
 			else:
 				enable_pred = i < self.config.num_hidden_layers - 1 
-			layers.append(SelfAttention(self.config, self.env, self.policy, i, skew_paths, lr_proj_path, enable_pred))
+			layers.append(SelfAttention(
+				self.config, self.env, self.policy, i, skew_paths, lr_proj_path,
+				enable_pred, self.moe_checkpoint,
+			))
 			self.attn_layer.append(len(layers) - 1)
-			layers.append(MLP(self.config, self.env, self.policy, i))
+			if get_ffn_kind(self.config, i) == FFNKind.ROUTED_MOE:
+				layers.append(MoEBlock(
+					self.config, self.env, self.policy, i, self.moe_checkpoint
+				))
+			else:
+				layers.append(MLP(
+					self.config, self.env, self.policy, i, self.moe_checkpoint
+				))
 
-		layers.append(OutputEmbed(self.config, self.env, self.policy))
+		layers.append(OutputEmbed(
+			self.config, self.env, self.policy, self.moe_checkpoint
+		))
 		self.layers = layers
 		self.num_layers = len(layers)
 
@@ -1170,7 +1338,10 @@ class LM:
 		if b_ln is not None:
 			hidden = F.layer_norm(input, (h,), weight=w_ln.data.to(dtype), bias=b_ln.data.to(dtype))
 		else:
-			hidden = rms_norm(input, w_ln.data.to(dtype))
+			hidden = rms_norm(
+				input, w_ln.data.to(dtype),
+				eps=getattr(self.config, 'rms_norm_eps', 1e-5),
+			)
 		if w_q.data.shape[1] == w_q.data.shape[0] + 1:
 			# print(f"hidden.shape={hidden.shape}")
 			hidden = torch.cat((hidden, torch.ones(b, 1, 1, dtype=dtype, device=hidden.device)), dim=-1)        
@@ -1183,7 +1354,8 @@ class LM:
 											next_partial_index, self.config.scaling,
 											self.config.num_attention_heads, self.config.num_kv_groups, 
 											self.policy.alpha, self.policy.max_num_kv, self.policy.token_group,
-											self.policy.att_score_mode)
+											self.policy.att_score_mode,
+											rms_norm_eps=getattr(self.config, 'rms_norm_eps', 1e-5))
 		prefetch_idx = self.process_fetch_idx(prefetch_idx)
 		self.layers[j].prefetch_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i, 
 												prefetch_idx, spec_stream=None)
@@ -1460,6 +1632,8 @@ class LM:
 			return pre+"Out"
 		elif j in self.attn_layer:
 			return pre+"Att"
+		elif isinstance(self.layers[j], MoEBlock):
+			return pre+"MoE"
 		else:
 			return pre+"MLP"
 
@@ -1582,7 +1756,7 @@ def get_inputs(prompt_len, num_prompts, tokenizer, path, model_type, seed):
 					tokenize=False,
 					add_generation_prompt=True
 				)
-			elif model_type == "qwen3":
+			elif is_qwen3_family(model_type):
 				text = tokenizer.apply_chat_template(
 					messages,
 					tokenize=False,
@@ -1601,11 +1775,6 @@ def get_inputs(prompt_len, num_prompts, tokenizer, path, model_type, seed):
 
 
 def run_flexgen(args):
-
-	tokenizer = AutoTokenizer.from_pretrained(args.model_path, padding_side="left")
-	if not hasattr(tokenizer, 'pad_token') or tokenizer.pad_token is None:
-		tokenizer.pad_token = tokenizer.eos_token
-		
 	num_prompts = args.num_gpu_batches * args.gpu_batch_size
 
 	args.en_cpu_relay = False # disable to save memory
@@ -1625,6 +1794,38 @@ def run_flexgen(args):
 		args.en_finer_prefetch_sync = True
 	########################################################
 	config = get_model_config(args.model_path)
+	moe_checkpoint = None
+	if config.model_type == 'qwen3_moe':
+		if args.percent[0] != 100 or args.percent[1] != 0:
+			raise ValueError(
+				"M1 Qwen3-MoE requires --percent to keep all weights resident "
+				"on GPU (first two values must be 100 0)"
+			)
+		moe_index = SafetensorIndex(args.model_path)
+		validate_qwen3_moe_index(moe_index, config, dtype=torch.bfloat16)
+		resident_weight_bytes = validate_resident_weight_budget(
+			qwen3_moe_resident_bytes(config, dtype=torch.bfloat16),
+			args.moe_resident_weight_limit_gb * GB,
+		)
+		print(
+			f"Qwen3-MoE checkpoint weight preflight: "
+			f"{resident_weight_bytes / GB:.3f} GiB within "
+			f"{args.moe_resident_weight_limit_gb:.3f} GiB limit",
+			flush=True,
+		)
+		# Opening every shard and validating shapes is intentionally delayed
+		# until the metadata-only size/name/budget gate succeeds.
+		moe_checkpoint = SafetensorCheckpoint(args.model_path)
+		routed_layers = validate_qwen3_moe_checkpoint(
+			moe_checkpoint,
+			config,
+			dtype=torch.bfloat16,
+		)
+		print(f"Validated routed MoE layers: {routed_layers}", flush=True)
+	########################################################
+	tokenizer = AutoTokenizer.from_pretrained(args.model_path, padding_side="left")
+	if not hasattr(tokenizer, 'pad_token') or tokenizer.pad_token is None:
+		tokenizer.pad_token = tokenizer.eos_token
 	########################################################
 	# Task and policy
 	# args.warmup_input_path = args.test_input_path if args.warmup_input_path is None else args.warmup_input_path
@@ -1637,6 +1838,9 @@ def run_flexgen(args):
 		assert args.nv_profile == 0, "NV Profiler is not supported in CPU only mode"
 		args.percent = [0, 100, 0, 0, 0, 100]
 	else:
+		# Configure CUDA only after all model metadata and resident-budget
+		# checks have succeeded. This keeps rejected MoE runs allocation-free.
+		torch.cuda.set_per_process_memory_fraction(0.85, device=0)
 		gpu = TorchDevice("cuda:0")
 	cpu = TorchDevice("cpu")
 	
@@ -1715,7 +1919,15 @@ def run_flexgen(args):
 		print("Setting skew_partial_idx_path to", args.skew_partial_idx_path)
 		
 	skew_paths = (args.skew_partial_idx_path, args.skew_matrix_path)
-	model = LM(config, env, args.model_path, policy, skew_paths, args.lr_proj_path)
+	model = LM(
+		config,
+		env,
+		args.model_path,
+		policy,
+		skew_paths,
+		args.lr_proj_path,
+		moe_checkpoint=moe_checkpoint,
+	)
 
 	try:        
 		# print("Warming up...")
@@ -1837,6 +2049,15 @@ def add_parser_arguments(parser):
  
 	parser.add_argument("--att_comp_mode", type=str, default='concat')
 	parser.add_argument("--seed", type=int, default=1234)
+	parser.add_argument(
+		"--moe_resident_weight_limit_gb",
+		type=float,
+		default=0.0,
+		help=(
+			"Explicit weight-only safety limit for fully resident Qwen3-MoE. "
+			"Leave 0 to reject resident MoE execution before allocation."
+		),
+	)
 	
  
 	

@@ -248,7 +248,7 @@ class TorchDevice:
 
 	@torch.inference_mode()
 	def output_embed(self, inputs, w_ln, b_ln, w_token, donate,
-						 do_sample, temperature):
+						 do_sample, temperature, rms_norm_eps=1e-5):
 		# decompress weights
 		if w_token.device.device_type == DeviceType.COMPRESSED:
 			w_token = w_token.device.decompress(w_token)
@@ -260,7 +260,7 @@ class TorchDevice:
 		if b_ln is not None:
 			hidden = F.layer_norm(hidden, (h,), weight=w_ln.data.to(dtype), bias=b_ln.data.to(dtype))
 		else:
-			hidden = rms_norm(hidden, w_ln.data.to(dtype))
+			hidden = rms_norm(hidden, w_ln.data.to(dtype), eps=rms_norm_eps)
 			
 		if donate[0]: inputs.delete()
 
@@ -276,8 +276,23 @@ class TorchDevice:
 		return TorchTensor.create_from_torch(ids, self)
 
 	
-	def init_cache_one_gpu_batch(self, config, task, policy):
-		raise NotImplementedError
+	def init_cache_one_gpu_batch(
+			self, config, task, policy, name=None, force_bf16=False,
+			batch_split=None, attr=None):
+		if batch_split is not None:
+			raise ValueError("batch_split is only supported by disk KV storage")
+		seq_len = (
+			task.prompt_len + task.gen_len - 1 + policy.token_group - 1
+		) // policy.token_group
+		seq_len *= policy.token_group
+		shape = (
+			policy.gpu_batch_size,
+			seq_len,
+			config.num_kv_heads * config.head_dim * 2,
+		)
+		return self.allocate(
+			shape, np.float16, name=name, force_bf16=force_bf16
+		)
 	
 	@staticmethod
 	@torch.inference_mode()
@@ -291,6 +306,8 @@ class TorchDevice:
 			idx = torch.arange(s, device=dev)
 			attn_mask_full = attention_mask.data.view(b, 1, 1, s) & (idx <= idx.view(s, 1)).view(1, 1, s, s)
 			neg_inf = torch.finfo(q.dtype).min
+			key = repeat_kv(k, kv_rep, h_dim=2)
+			value = repeat_kv(v, kv_rep, h_dim=2)
 			
 		for start in range(0, s, eff_chunk):
 			end = min(start + eff_chunk, s)
@@ -320,7 +337,8 @@ class TorchDevice:
 				w_q, b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, q_norm, k_norm,
 				n_head, head_dim, scaling, kv_rep, pos_emb,
 				lr_proj_mode, donate, 
-				compress_cache, comp_config, flashatt, chunk_size):
+				compress_cache, comp_config, flashatt, chunk_size,
+				rms_norm_eps=1e-5):
 
 		b, s, d = inputs.shape
 		dtype = inputs.data.dtype
@@ -328,7 +346,7 @@ class TorchDevice:
 		if b_ln is not None:
 			hidden = F.layer_norm(inputs.data, (d,), weight=w_ln.data.to(dtype), bias=b_ln.data.to(dtype))
 		else:
-			hidden = rms_norm(inputs.data, w_ln.data.to(dtype))
+			hidden = rms_norm(inputs.data, w_ln.data.to(dtype), eps=rms_norm_eps)
 
 		# shape: (b, s, h)
 		if w_q.data.shape[1] == w_q.data.shape[0] + 1:
@@ -346,10 +364,10 @@ class TorchDevice:
 		# shape: (b, s, n_head, head_dim)
 		q = q.view(b, s, n_head, head_dim) # b, s, h, d
 		if q_norm is not None:
-			q = rms_norm(q, q_norm.data.to(dtype))
+			q = rms_norm(q, q_norm.data.to(dtype), eps=rms_norm_eps)
 		k = k.view(b, s, -1, head_dim) 
 		if k_norm is not None:
-			k = rms_norm(k, k_norm.data.to(dtype))
+			k = rms_norm(k, k_norm.data.to(dtype), eps=rms_norm_eps)
 		v = v.view(b, s, -1, head_dim)
 
 		if pos_emb is not None:
@@ -411,7 +429,7 @@ class TorchDevice:
 				kv_layout, token_group,
 				att_ins, donate, compress_cache, comp_config, 
 				spec_stream, prefetch_event, prefetch_sync, alpha, max_num_kv, score_mode, 
-				att_comp_mode='mixed'): # mixed / concat 
+				att_comp_mode='mixed', rms_norm_eps=1e-5): # mixed / concat
 		"""Multi-head attention (decoding phase)."""
 
 		dtype = inputs.data.dtype
@@ -422,7 +440,7 @@ class TorchDevice:
 		if b_ln is not None:
 			hidden = F.layer_norm(inputs.data, (d,), weight=w_ln.data.to(dtype), bias=b_ln.data.to(dtype))
 		else:
-			hidden = rms_norm(inputs.data, w_ln.data.to(dtype))
+			hidden = rms_norm(inputs.data, w_ln.data.to(dtype), eps=rms_norm_eps)
 
 		if w_q.data.shape[1] == w_q.data.shape[0] + 1:
 			hidden_ = torch.cat((hidden, torch.ones(b, 1, 1, dtype=hidden.dtype, device=hidden.device)), dim=-1)
@@ -445,13 +463,13 @@ class TorchDevice:
 																	next_qproj, next_qnorm, next_lr_kproj, next_lr_kcache, pos_emb,
 																	next_partial_index, scaling,
 																	n_head, kv_rep, alpha, max_num_kv, token_group, 
-																	score_mode)
+																		score_mode, rms_norm_eps=rms_norm_eps)
 				else:
 					att_ins.prefetch_idx = speculate_attention(lr_proj_mode, spec_hidden_in, next_partial_wq, skew_matrix, 
 																next_qproj, next_qnorm, next_lr_kproj, next_lr_kcache, pos_emb,
 																next_partial_index, scaling,
 																n_head, kv_rep, alpha, max_num_kv, token_group,
-																score_mode)
+																score_mode, rms_norm_eps=rms_norm_eps)
 			if prefetch_event is not None:
 				def func():
 					if prefetch_sync is not None:
@@ -473,10 +491,10 @@ class TorchDevice:
 			v_new = F.linear(hidden, w_v.data.to(dtype), bias=b_v.data.to(dtype) if b_v is not None else None)
 			q = q.view(b, tgt_s, n_head, head_dim) # b, s, h, d
 			if q_norm is not None:
-				q = rms_norm(q, q_norm.data.to(dtype))
+				q = rms_norm(q, q_norm.data.to(dtype), eps=rms_norm_eps)
 			k_new = k_new.view(b, tgt_s, -1, head_dim) # b, s, h, d
 			if k_norm is not None:
-				k_new = rms_norm(k_new, k_norm.data.to(dtype))
+				k_new = rms_norm(k_new, k_norm.data.to(dtype), eps=rms_norm_eps)
 			v_new = v_new.view(b, tgt_s, -1, head_dim) # b, s, h, d
 			if pos_emb is not None:
 				q, k_new = apply_rotary_pos_emb(q, k_new, *pos_emb, layout='bshd')       
@@ -504,7 +522,7 @@ class TorchDevice:
 					if b_ln is not None:
 						past_hidden = F.layer_norm(past_hidden, (d,), weight=w_ln.data.to(dtype), bias=b_ln.data.to(dtype))
 					else:
-						past_hidden = rms_norm(past_hidden, w_ln.data.to(dtype))
+						past_hidden = rms_norm(past_hidden, w_ln.data.to(dtype), eps=rms_norm_eps)
 					if w_q.data.shape[1] == w_q.data.shape[0] + 1:
 						past_hidden_ = torch.cat((past_hidden, torch.ones(b, past_hidden.shape[1], 1, dtype=hidden.dtype, device=hidden.device)), dim=-1) 
 						k = F.linear(past_hidden_, w_k.data.to(dtype), bias=None)
@@ -514,7 +532,7 @@ class TorchDevice:
 					v = F.linear(past_hidden, w_v.data.to(dtype), bias=b_v.data.to(dtype) if b_v is not None else None)  
 					k = k.view(b, past_hidden.shape[1], -1, head_dim) # b, s-1, h, d
 					if k_norm is not None:
-						k = rms_norm(k, k_norm.data.to(dtype))
+						k = rms_norm(k, k_norm.data.to(dtype), eps=rms_norm_eps)
 					v = v.view(b, past_hidden.shape[1], -1, head_dim) # b, s-1, h, d
 					del past_hidden, kv_cache
 					if past_pos_emb is not None:
@@ -602,24 +620,26 @@ class TorchDevice:
 		return TorchTensor.create_from_torch(out, self)
 	
 	@torch.inference_mode()
-	def llama_mlp_gen(self, inputs, w_gate, w_up, w_down, w_norm, donate, act):
+	def llama_mlp_gen(self, inputs, w_gate, w_up, w_down, w_norm, donate, act,
+					rms_norm_eps=1e-5):
 		# assert act == 'silu', f"Unsupported activation: {act}"
 		dtype = inputs.data.dtype
-		out = rms_norm(inputs.data, w_norm.data.to(dtype))
+		out = rms_norm(inputs.data, w_norm.data.to(dtype), eps=rms_norm_eps)
 		out = llama_mlp_func(out, w_gate.data, w_up.data, w_down.data)
 		out.add_(inputs.data)
 		if donate[0]: inputs.delete()
 		return TorchTensor.create_from_torch(out, self)
 	
 	@torch.inference_mode()
-	def llama_mlp(self, inputs, w_gate, w_up, w_down, w_norm, donate, act, chunk_size=-1):
+	def llama_mlp(self, inputs, w_gate, w_up, w_down, w_norm, donate, act,
+				  chunk_size=-1, rms_norm_eps=1e-5):
 		# assert act == 'silu', f"Unsupported activation: {act}"
 		dtype = inputs.data.dtype
 		s = inputs.data.shape[1]
 		eff_chunk = chunk_size if 0 < chunk_size < s else s
 		for start in range(0, s, eff_chunk):
 			end = min(start + eff_chunk, s)
-			inputs.data[:, start:end] = llama_mlp_func(rms_norm(inputs.data[:, start:end], w_norm.data.to(dtype)), 
+			inputs.data[:, start:end] = llama_mlp_func(rms_norm(inputs.data[:, start:end], w_norm.data.to(dtype), eps=rms_norm_eps),
 											w_gate.data, w_up.data, w_down.data) + inputs.data[:, start:end]
 		# if donate[0]: inputs.delete()
 		return TorchTensor.create_from_torch(inputs.data, self)
@@ -1176,4 +1196,3 @@ def copy_worker_func(queue, cuda_id, en_cpu_relay, mmap_dict, cfg):
 				dst_data.writein(dst_indices, src_data[src_indices] if src_indices else src_data)
 		del src_data, dst_data, dst, dst_indices, src, src_indices, item
 		queue.task_done()
-
