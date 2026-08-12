@@ -8,6 +8,7 @@ from expert_store import (
     ExpertStore,
     pack_qwen3_expert_store,
     qwen3_checkpoint_digest,
+    qwen3_fixed_checkpoint_digest,
 )
 from model_config import get_model_config
 from moe_weights import SafetensorCheckpoint
@@ -41,10 +42,12 @@ def main():
             args.store,
             config=config,
             expected_source_revision=args.source_revision,
-            expected_checkpoint_digest=qwen3_checkpoint_digest(
+            expected_fixed_checkpoint_digest=qwen3_fixed_checkpoint_digest(
                 checkpoint, config
             ),
         )
+        if store.checkpoint_digest != qwen3_checkpoint_digest(checkpoint, config):
+            raise ValueError("expert store full checkpoint digest mismatch")
         count = store.verify_checksums()
         print(json.dumps({"verified_extents": count, "store": str(store.root)}))
 

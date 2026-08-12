@@ -22,6 +22,7 @@ from expert_store import (
     qwen3_moe_fixed_weight_bytes,
     qwen3_moe_largest_fixed_tensor_bytes,
     qwen3_checkpoint_digest,
+    qwen3_fixed_checkpoint_digest,
 )
 from moe import ResidentExpertProvider, qwen3_moe_forward
 from moe_weights import (
@@ -80,20 +81,31 @@ class ExpertStoreTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as checkpoint_dir, tempfile.TemporaryDirectory() as root:
             store = self.pack(checkpoint_dir, Path(root, "store"))
             checkpoint = SafetensorCheckpoint(checkpoint_dir)
-            exact = qwen3_checkpoint_digest(checkpoint, self.config)
             ExpertStore(
                 store.root,
                 config=self.config,
                 expected_source_revision="fixture-revision",
-                expected_checkpoint_digest=exact,
+                expected_fixed_checkpoint_digest=qwen3_fixed_checkpoint_digest(
+                    checkpoint, self.config
+                ),
             )
-            with self.assertRaisesRegex(ValueError, "checkpoint digest mismatch"):
+            with self.assertRaisesRegex(ValueError, "fixed checkpoint digest mismatch"):
                 ExpertStore(
                     store.root,
                     config=self.config,
                     expected_source_revision="fixture-revision",
-                    expected_checkpoint_digest="0" * 64,
+                    expected_fixed_checkpoint_digest="0" * 64,
                 )
+
+    def test_manifest_checksum_root_rejects_extent_checksum_tampering(self):
+        with tempfile.TemporaryDirectory() as checkpoint_dir, tempfile.TemporaryDirectory() as root:
+            store = self.pack(checkpoint_dir, Path(root, "store"))
+            manifest_path = store.root / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["extents"][0]["checksum"] = "0" * 64
+            manifest_path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "checksum root mismatch"):
+                self.load_store(store.root)
 
     def test_expert_only_checkpoint_change_breaks_content_binding(self):
         with tempfile.TemporaryDirectory() as checkpoint_a, tempfile.TemporaryDirectory() as checkpoint_b:

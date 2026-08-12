@@ -241,7 +241,11 @@ resident/HF parity는 large-memory reference system이 필요한 독립 open ite
 M2 synchronous storage/lifecycle closure를 막지 않는다. 전체 architecture correctness는
 이 parity evidence 전까지 closed로 부르지 않는다.
 
-모든 항목을 통과해야 Qwen3-MoE M1을 완료한 것으로 본다. 다음 우선순위는 Qwen3-MoE의 실제 Jetson synchronous demand loading(M2)이며, 가능하면 bounded cache(M3)까지 vertical slice를 확보한 뒤 아래 architecture 확장을 시작한다. 추가 모델에는 각자의 resident-parity gate를 통과하기 전 expert offloading을 활성화하지 않는다.
+Fixture integration M1은 위의 완료 항목으로 닫고, 전체 architecture correctness는 열린
+실제-checkpoint parity 항목까지 통과해야 완료한 것으로 본다. 다음 우선순위는 bounded
+cache(M3)이며, 가능하면 Qwen3 vertical slice를 확보한 뒤 아래 architecture 확장을
+시작한다. 추가 모델에는 각자의 resident-parity gate를 통과하기 전 expert offloading을
+활성화하지 않는다.
 
 ## 10. Qwen3-MoE 성공 이후 architecture 확장
 

@@ -120,12 +120,29 @@ def qwen3_moe_largest_fixed_tensor_bytes(config, dtype=torch.bfloat16):
     )
 
 
+def qwen3_fixed_checkpoint_digest(checkpoint, config, dtype=torch.bfloat16):
+    """Stream a canonical digest over the exact runtime-resident tensors."""
+    from moe_weights import qwen3_moe_resident_expected
+
+    expected = {
+        name: value
+        for name, value in qwen3_moe_resident_expected(config, dtype=dtype).items()
+        if ".mlp.experts." not in name
+    }
+    checkpoint.validate(expected)
+    return _checkpoint_tensor_digest(checkpoint, expected)
+
+
 def qwen3_checkpoint_digest(checkpoint, config, dtype=torch.bfloat16):
     """Stream a canonical digest over every checkpoint tensor and its metadata."""
     from moe_weights import qwen3_moe_resident_expected
 
     expected = qwen3_moe_resident_expected(config, dtype=dtype)
     checkpoint.validate(expected)
+    return _checkpoint_tensor_digest(checkpoint, expected)
+
+
+def _checkpoint_tensor_digest(checkpoint, expected):
     digest = hashlib.sha256()
     for name in sorted(expected):
         spec = checkpoint.tensor_specs[name]
@@ -137,6 +154,16 @@ def qwen3_checkpoint_digest(checkpoint, config, dtype=torch.bfloat16):
         raw = tensor.contiguous().view(torch.uint8).numpy()
         digest.update(raw)
         del tensor, raw
+    return digest.hexdigest()
+
+
+def expert_checksum_root(extents):
+    """Bind the manifest to its ordered per-expert source content checksums."""
+    digest = hashlib.sha256()
+    for extent in sorted(extents, key=lambda item: (item["layer_id"], item["expert_id"])):
+        digest.update(f"{extent['layer_id']}:{extent['expert_id']}:".encode("ascii"))
+        digest.update(extent["checksum"].encode("ascii"))
+        digest.update(b"\n")
     return digest.hexdigest()
 
 
@@ -217,7 +244,7 @@ class ExpertStore:
     """Strictly validated read-only expert extent index."""
 
     def __init__(self, root, config=None, expected_source_revision=None,
-                 expected_checkpoint_digest=None):
+                 expected_fixed_checkpoint_digest=None):
         self.root = Path(root)
         manifest_path = self.root / "manifest.json"
         try:
@@ -240,6 +267,7 @@ class ExpertStore:
                 f"store={self.source_revision!r}, checkpoint={expected_source_revision!r}"
             )
         self.checkpoint_digest = manifest.get("checkpoint_sha256")
+        self.fixed_checkpoint_digest = manifest.get("fixed_checkpoint_sha256")
         if (
             not isinstance(self.checkpoint_digest, str)
             or len(self.checkpoint_digest) != 64
@@ -250,10 +278,16 @@ class ExpertStore:
         ):
             raise ValueError("expert store checkpoint digest is invalid")
         if (
-            expected_checkpoint_digest is not None
-            and self.checkpoint_digest != expected_checkpoint_digest
+            not isinstance(self.fixed_checkpoint_digest, str)
+            or len(self.fixed_checkpoint_digest) != 64
+            or any(character not in "0123456789abcdef" for character in self.fixed_checkpoint_digest)
         ):
-            raise ValueError("expert store checkpoint digest mismatch")
+            raise ValueError("expert store fixed checkpoint digest is invalid")
+        if (
+            expected_fixed_checkpoint_digest is not None
+            and self.fixed_checkpoint_digest != expected_fixed_checkpoint_digest
+        ):
+            raise ValueError("expert store fixed checkpoint digest mismatch")
         self.alignment = manifest.get("alignment")
         _align_up(0, self.alignment)
         if config is not None:
@@ -266,6 +300,7 @@ class ExpertStore:
         raw_extents = manifest.get("extents")
         if not isinstance(raw_extents, list) or not raw_extents:
             raise ValueError("expert manifest has no extents")
+        self.expert_checksum_root = manifest.get("expert_checksum_root")
         self.extents = {}
         file_ranges = {}
         for raw in raw_extents:
@@ -277,6 +312,8 @@ class ExpertStore:
             file_ranges.setdefault(extent.file, []).append(
                 (extent.offset, extent.offset + extent.stored_bytes, key)
             )
+        if self.expert_checksum_root != expert_checksum_root(raw_extents):
+            raise ValueError("expert manifest checksum root mismatch")
 
         for filename, ranges in file_ranges.items():
             path = self.root / filename
@@ -435,6 +472,7 @@ def pack_qwen3_expert_store(checkpoint, config, output_dir, alignment=DEFAULT_AL
                 expected[name] = (shape, torch.bfloat16)
     checkpoint.validate(expected)
     checkpoint_digest = qwen3_checkpoint_digest(checkpoint, config)
+    fixed_checkpoint_digest = qwen3_fixed_checkpoint_digest(checkpoint, config)
 
     data_name = "experts-000.bin"
     temporary = output_dir / f".{data_name}.tmp-{os.getpid()}"
@@ -513,6 +551,8 @@ def pack_qwen3_expert_store(checkpoint, config, output_dir, alignment=DEFAULT_AL
             "config_fingerprint": fingerprint,
             "source_revision": source_revision,
             "checkpoint_sha256": checkpoint_digest,
+            "fixed_checkpoint_sha256": fixed_checkpoint_digest,
+            "expert_checksum_root": expert_checksum_root(extents),
             "extents": extents,
         }
         manifest_tmp = output_dir / f".manifest.json.tmp-{os.getpid()}"
@@ -535,7 +575,7 @@ def pack_qwen3_expert_store(checkpoint, config, output_dir, alignment=DEFAULT_AL
         raise
     return ExpertStore(
         output_dir, config=config, expected_source_revision=source_revision,
-        expected_checkpoint_digest=checkpoint_digest,
+        expected_fixed_checkpoint_digest=fixed_checkpoint_digest,
     )
 
 

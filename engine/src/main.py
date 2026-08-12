@@ -40,7 +40,7 @@ from expert_store import (
 	Qwen3DemandExpertProviderFactory,
 	estimate_qwen3_moe_demand_memory,
 	qwen3_expert_logical_bytes,
-	qwen3_checkpoint_digest,
+	qwen3_fixed_checkpoint_digest,
 	qwen3_moe_fixed_weight_bytes,
 )
 from moe_weights import (
@@ -1937,11 +1937,11 @@ def run_flexgen(args):
 			# Capacity is approved before shards are opened. This then streams only
 			# fixed/router tensors, never the 54 GiB expert bank.
 			moe_checkpoint = SafetensorCheckpoint(args.model_path)
-			checkpoint_digest = qwen3_checkpoint_digest(
+			fixed_checkpoint_digest = qwen3_fixed_checkpoint_digest(
 				moe_checkpoint, config, dtype=torch.bfloat16
 			)
-			if checkpoint_digest != moe_expert_store.checkpoint_digest:
-				raise ValueError("expert store checkpoint digest mismatch")
+			if fixed_checkpoint_digest != moe_expert_store.fixed_checkpoint_digest:
+				raise ValueError("expert store fixed checkpoint digest mismatch")
 		print(
 			f"Qwen3-MoE {args.expert_mode} weight approval: "
 			f"{approved_weight_bytes / GB:.3f} GiB within "

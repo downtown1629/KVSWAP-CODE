@@ -98,8 +98,9 @@ expert component 하나씩 처리하며, 생성 직후 source와 byte-level chec
 atomic rename하여 불완전 artifact가 정상 store로 보이지 않게 한다.
 
 Startup validation은 config fingerprint, layer/expert coverage, shape/dtype, extent 범위,
-정렬, 중복/겹침 및 실제 file size를 검사한다. 전체 58 GiB 재해시는 offline verify
-mode로 두고, runtime hot path의 checksum은 fixture/debug mode에서만 수행한다.
+정렬, 중복/겹침, 실제 file size, fixed-tensor digest와 ordered expert-checksum root를
+검사한다. 전체 checkpoint content digest와 모든 packed extent 재해시는 offline verify
+mode로만 수행한다. Runtime startup은 source expert bank를 읽지 않는다.
 
 ## 5. Memory와 I/O semantics
 

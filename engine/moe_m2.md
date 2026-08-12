@@ -11,11 +11,13 @@ next call. There is no expert cache, prefetch, overlap, quantization, or reuse.
 `scripts/pack_qwen3_moe_experts.py` streams BF16 gate/up/down tensors into one
 4096-byte-aligned extent per `(layer, expert)`. `manifest.json` records a config
 fingerprint, exact shapes and byte ranges, source revision, a canonical SHA-256
-over every checkpoint tensor's metadata and bytes, and per-expert
-SHA-256. Startup validates coverage, overlap, alignment, file bounds, shapes,
-representation, and an explicitly supplied immutable checkpoint revision before
-CUDA allocation. Offline verification
-rehashes every extent.
+over every checkpoint tensor's metadata and bytes, a resident/fixed-tensor
+digest, and an aggregate root over the per-expert SHA-256 values. Startup
+validates coverage, overlap, alignment, file bounds, shapes, representation,
+the explicitly supplied immutable revision, the fixed-tensor digest, and the
+expert checksum root before CUDA allocation. It deliberately does not reread
+the source checkpoint's 54 GiB expert bank. The explicit offline `verify`
+command checks the full checkpoint digest and rehashes every packed extent.
 
 The Jetson backend uses `O_DIRECT`, a reusable page-aligned CUDA-registered host
 buffer, and synchronous io_uring submit/wait. All layers share that staging
