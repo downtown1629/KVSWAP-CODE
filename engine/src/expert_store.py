@@ -314,6 +314,8 @@ class ExpertStore:
             )
         if self.expert_checksum_root != expert_checksum_root(raw_extents):
             raise ValueError("expert manifest checksum root mismatch")
+        if set(file_ranges) != {"experts-000.bin"}:
+            raise ValueError("M2 v1 requires exactly one experts-000.bin data file")
 
         for filename, ranges in file_ranges.items():
             path = self.root / filename
@@ -327,9 +329,6 @@ class ExpertStore:
                 if end > file_size:
                     raise ValueError(f"expert extent {key} exceeds {filename} size")
                 previous_end = end
-        if set(file_ranges) != {"experts-000.bin"}:
-            raise ValueError("M2 v1 requires exactly one experts-000.bin data file")
-
         if config is not None:
             expected = {
                 (layer_id, expert_id)

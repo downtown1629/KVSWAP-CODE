@@ -18,6 +18,9 @@ the explicitly supplied immutable revision, the fixed-tensor digest, and the
 expert checksum root before CUDA allocation. It deliberately does not reread
 the source checkpoint's 54 GiB expert bank. The explicit offline `verify`
 command checks the full checkpoint digest and rehashes every packed extent.
+Runtime provenance therefore trusts that this offline approval was performed
+for the supplied immutable revision; it is not a substitute for artifact
+signing or a trusted external digest registry.
 
 The Jetson backend uses `O_DIRECT`, a reusable page-aligned CUDA-registered host
 buffer, and synchronous io_uring submit/wait. All layers share that staging

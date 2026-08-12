@@ -123,6 +123,19 @@ class ExpertStoreTest(unittest.TestCase):
             )
         self.assertNotEqual(digest_a, digest_b)
 
+    def test_runtime_fixed_digest_never_requests_expert_tensors(self):
+        checkpoint = mock.Mock()
+        with mock.patch(
+            "expert_store._checkpoint_tensor_digest", return_value="digest"
+        ) as digest:
+            self.assertEqual(
+                qwen3_fixed_checkpoint_digest(checkpoint, self.config), "digest"
+            )
+        expected = digest.call_args.args[1]
+        self.assertTrue(expected)
+        self.assertFalse(any(".mlp.experts." in name for name in expected))
+        checkpoint.validate.assert_called_once_with(expected)
+
     def test_pack_is_aligned_lossless_and_complete(self):
         with tempfile.TemporaryDirectory() as checkpoint_dir, tempfile.TemporaryDirectory() as root:
             store_dir = Path(root, "store")
