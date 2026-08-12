@@ -27,6 +27,10 @@ run_fixture() {
     local expert_trace=${6:-none}
     local offload_dir
     offload_dir=$(mktemp -d /tmp/kvswap-qwen3-moe-m2-offload.XXXXXX)
+    if [[ "$(stat -c %d "$offload_dir")" != "$(stat -c %d "$STORE_DIR")" ]]; then
+        echo "expert store and KV offload must be on the same filesystem device" >&2
+        exit 2
+    fi
     local kv_args=(
         --percent 100 0 100 0 100 0
         --run_args L0 --lr_proj_mode none --dk_rd none
@@ -85,6 +89,10 @@ calls, reads, logical_bytes, stored_bytes = map(int, match.groups()[:4])
 read_ms, copy_ms = map(float, match.groups()[4:])
 expert_bytes = 3 * 128 * 64 * 2
 stored_per_expert = ((expert_bytes + 4095) // 4096) * 4096
+if calls != 10 or reads != 20:
+    raise SystemExit(f"expected 10 calls/20 reads, got {calls}/{reads}")
+if logical_bytes != 983040:
+    raise SystemExit(f"expected 983040 expert bytes, got {logical_bytes}")
 if calls <= 0 or reads <= 0:
     raise SystemExit("expert demand path performed no reads")
 if logical_bytes != reads * expert_bytes:
@@ -145,7 +153,7 @@ kv_bytes = 128 * 2 * 1 * 64 * 2
 print(f"Joint logical I/O verified: expert={expert_bytes}, KV={kv_bytes}, total={expert_bytes + kv_bytes}")
 PY
         ;;
-    real-demand)
+    real-qwen3-30b)
         : "${M2_MODEL_PATH:?set M2_MODEL_PATH to the Qwen3-MoE checkpoint}"
         : "${M2_EXPERT_STORE:?set M2_EXPERT_STORE to the packed expert store}"
         : "${M2_CHECKPOINT_REVISION:?set M2_CHECKPOINT_REVISION to its immutable revision}"
@@ -162,14 +170,33 @@ PY
             --expert_mode demand --moe_expert_store "$M2_EXPERT_STORE" \
             --moe_checkpoint_revision "$M2_CHECKPOINT_REVISION" \
             --moe_expert_reader direct --moe_expert_scratch_slots 8 \
-            --moe_demand_weight_limit_gb 4 --moe_system_headroom_gb 1.5 \
+        --moe_demand_weight_limit_gb "${M2_DEMAND_WEIGHT_LIMIT_GB:?set an explicit approval limit}" \
+        --moe_system_headroom_gb "${M2_SYSTEM_HEADROOM_GB:-1.5}" \
             --moe_token_chunk_size 1 >"$RUN_LOG" 2>&1
         cat "$RUN_LOG"
-        grep -q "Expert demand I/O: calls=" "$RUN_LOG"
+        grep -Fqx "0: The team" "$RUN_LOG"
         grep -q "Peak Memory (GB)" "$RUN_LOG"
+        "$PYTHON" - "$RUN_LOG" <<'PY'
+import re
+import sys
+
+text = open(sys.argv[1]).read()
+io = re.search(
+    r"Expert demand I/O: calls=(\d+), reads=(\d+), "
+    r"logical_bytes=(\d+), stored_bytes=(\d+)", text
+)
+if io is None or tuple(map(int, io.groups())) != (
+    3120, 24960, 235552112640, 235552112640
+):
+    raise SystemExit(f"unexpected real-demand accounting: {io.groups() if io else None}")
+peak = re.search(r"Peak Memory \(GB\) RSS: ([0-9.]+)", text)
+if peak is None or float(peak.group(1)) >= 5.5:
+    raise SystemExit(f"real-demand peak RSS is missing or unsafe: {peak.group(1) if peak else None}")
+print(f"Real demand gate verified: output=The team, RSS={peak.group(1)} GiB")
+PY
         ;;
     *)
-        echo "usage: $0 {static|fixture-buffered|fixture-direct|fixture-fullkv|fixture-kvswap|real-demand}" >&2
+        echo "usage: $0 {static|fixture-buffered|fixture-direct|fixture-fullkv|fixture-kvswap|real-qwen3-30b}" >&2
         exit 2
         ;;
 esac

@@ -21,6 +21,7 @@ from expert_store import (
     qwen3_expert_store_required_bytes,
     qwen3_moe_fixed_weight_bytes,
     qwen3_moe_largest_fixed_tensor_bytes,
+    qwen3_checkpoint_digest,
 )
 from moe import ResidentExpertProvider, qwen3_moe_forward
 from moe_weights import (
@@ -74,6 +75,41 @@ class ExpertStoreTest(unittest.TestCase):
             config=self.config,
             expected_source_revision="fixture-revision",
         )
+
+    def test_store_is_bound_to_exact_checkpoint_bytes(self):
+        with tempfile.TemporaryDirectory() as checkpoint_dir, tempfile.TemporaryDirectory() as root:
+            store = self.pack(checkpoint_dir, Path(root, "store"))
+            checkpoint = SafetensorCheckpoint(checkpoint_dir)
+            exact = qwen3_checkpoint_digest(checkpoint, self.config)
+            ExpertStore(
+                store.root,
+                config=self.config,
+                expected_source_revision="fixture-revision",
+                expected_checkpoint_digest=exact,
+            )
+            with self.assertRaisesRegex(ValueError, "checkpoint digest mismatch"):
+                ExpertStore(
+                    store.root,
+                    config=self.config,
+                    expected_source_revision="fixture-revision",
+                    expected_checkpoint_digest="0" * 64,
+                )
+
+    def test_expert_only_checkpoint_change_breaks_content_binding(self):
+        with tempfile.TemporaryDirectory() as checkpoint_a, tempfile.TemporaryDirectory() as checkpoint_b:
+            self.make_checkpoint(checkpoint_a)
+            tensors = self.make_checkpoint(checkpoint_b)
+            name = "model.layers.0.mlp.experts.0.gate_proj.weight"
+            tensors[name] = tensors[name].clone()
+            tensors[name].view(-1)[0] += torch.tensor(1, dtype=torch.bfloat16)
+            save_file(tensors, str(Path(checkpoint_b, "model.safetensors")))
+            digest_a = qwen3_checkpoint_digest(
+                SafetensorCheckpoint(checkpoint_a), self.config
+            )
+            digest_b = qwen3_checkpoint_digest(
+                SafetensorCheckpoint(checkpoint_b), self.config
+            )
+        self.assertNotEqual(digest_a, digest_b)
 
     def test_pack_is_aligned_lossless_and_complete(self):
         with tempfile.TemporaryDirectory() as checkpoint_dir, tempfile.TemporaryDirectory() as root:
@@ -214,6 +250,36 @@ class ExpertStoreTest(unittest.TestCase):
                     SynchronousExtentReader(handle.name, direct=True)
             after = len(os.listdir("/proc/self/fd"))
         self.assertEqual(after, before)
+
+    def test_close_retries_staging_release_after_unregister_failure(self):
+        with tempfile.NamedTemporaryFile() as handle:
+            handle.write(b"x" * DEFAULT_ALIGNMENT)
+            handle.flush()
+            reader = SynchronousExtentReader(handle.name)
+            reader._ensure_capacity(DEFAULT_ALIGNMENT)
+            reader._registered_address = 12345
+            calls = 0
+
+            def fail_once(result, operation):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise RuntimeError("injected unregister failure")
+
+            reader._cuda_result = fail_once
+            reader.pin_cuda = True
+            with mock.patch.object(
+                torch.cuda,
+                "cudart",
+                return_value=SimpleNamespace(cudaHostUnregister=lambda address: 0),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "injected"):
+                    reader.close()
+                self.assertIsNotNone(reader.buffer)
+                reader.close()
+            self.assertIsNone(reader.fd)
+            self.assertIsNone(reader.buffer)
+            self.assertIsNone(reader._registered_address)
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA host registration")
     def test_direct_cuda_registered_lifecycle_is_bounded(self):

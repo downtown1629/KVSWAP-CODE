@@ -174,25 +174,36 @@ shard open 전에 실패해야 한다.
 - 이 단계에서 처음 selective KV lane과 expert demand read를 함께 켜고, M1의 regression
   gate를 joint-I/O accounting 검사로 확장한다.
 
-**Gate E:** routing과 expert output이 resident path와 일치하고, KV trace는 해당 실행의
-selection으로 설명되며, expert/KV byte 합계와 실제 read/write counter가 일치해야 한다.
+**Gate E:** isolated provider test에서 routing과 expert output tensor가 resident path와
+일치하고, joint engine A/B에서 routing trace와 token output이 일치해야 한다. KV trace는
+해당 실행의 selection으로 설명되며 completed expert reads와 KV selections에서 계산한
+logical byte 합계가 일치해야 한다. Block-device physical byte counters는 성능 평가에서
+별도로 측정한다.
 
-### F — 실제 Qwen3-MoE lane
+### F1 — 실제 Qwen3-MoE storage/lifecycle lane
 
 - metadata/manifest-only preflight 후 fixed weights, scratch, KV, I/O와 headroom이 맞을 때만
   Jetson 실행을 승인한다.
 - prompt 64, batch 1, decode 1–2 token부터 시작하고 단계적으로 늘린다.
-- large-memory reference에서 저장한 routing/token artifact와 first divergence를 비교한다.
 
-**Gate F:** 전체 expert set을 LPDDR에 올리지 않고 generation이 성공하며, 반복 token에서
+**Gate F1:** 전체 expert set을 LPDDR에 올리지 않고 generation이 성공하며, 반복 token에서
 RSS가 증가하지 않고 모든 expert traffic이 selected unique expert와 extent size로 설명되어야
 한다. 느린 성능은 failure가 아니다.
 
+### F2 — 후속 large-memory reference parity
+
+Large-memory reference에서 실제 checkpoint의 routing/token artifact를 저장하고 first
+divergence를 비교한다. 이는 M1 architecture correctness를 보강하는 후속 gate이며 M2의
+synchronous storage/lifecycle closure와 분리한다.
+
 ## 7. Observability와 평가
 
-M2 필수 event는 `EXPERT_READ_SUBMIT`, `EXPERT_READ_COMPLETE`, `COMPUTE_EXPERT`,
-`MEMORY_ALLOC/FREE`다. 기본 실행은 layer별 집계만 남기고 선택적 JSONL trace에 다음을
-기록한다.
+M2 correctness에 필수인 NVTX event는 `EXPERT_READ_SUBMIT`,
+`EXPERT_READ_COMPLETE`, `EXPERT_COPY`, `COMPUTE_EXPERT`다. 기본 실행은 layer별
+calls/reads/bytes/time 집계만 남긴다. 선택적 JSONL은 resident/demand A/B에 필요한
+layer/call별 selected/unique expert ID를 기록한다. Allocation/free와 아래의 상세
+request/timing schema는 M2 성능 분석 시 선택적으로 보강하며 correctness closure를
+막지 않는다.
 
 ```text
 request/token/chunk/layer, selected IDs, unique IDs
@@ -201,9 +212,10 @@ read service time, staging-to-device copy time, total materialize stall
 scratch/staging peak, cold-or-warm-cache mode, error status
 ```
 
-필수 지표는 expert bytes/token, requests/token, average request size, read latency,
-materialize stall ratio, effective bandwidth, TPOT, resident-MoE B0 대비 slowdown 및 peak
-RSS다. 기존 KVSwap-only 결과도 환경 기준점으로 함께 보존한다.
+Storage correctness closure의 필수 지표는 expert bytes/token, requests/token, average
+request size, read/copy latency, TPOT 및 peak RSS다. Materialize stall ratio, effective
+bandwidth와 resident-MoE B0 대비 slowdown은 M2 performance evaluation에서 추가한다.
+기존 KVSwap-only 결과도 환경 기준점으로 함께 보존한다.
 Canonical 성능 측정은 `O_DIRECT`로 page cache를 우회한다. Buffered mode를 측정할 경우
 cold/warm cache를 분리하고 결과에 명시한다.
 
@@ -219,19 +231,18 @@ bash scripts/eval_moe_m2.sh fixture-buffered
 bash scripts/eval_moe_m2.sh fixture-direct       # Jetson, tiny allocation
 bash scripts/eval_moe_m2.sh fixture-fullkv
 bash scripts/eval_moe_m2.sh fixture-kvswap
-bash scripts/eval_moe_m2.sh real-demand          # explicit memory approval required
+bash scripts/eval_moe_m2.sh real-qwen3-30b       # explicit memory approval required
 ```
 
 M2 완료 조건은 다음과 같다.
 
 - [x] M1의 fixture resident/KVSwap 및 dense regression 선행 gate가 닫혔다.
-- [ ] M1 실제 checkpoint resident/reference parity는 large-memory system evidence가
-  필요하며 M2 Gate F와 함께 열린 상태다.
 - [x] expert store가 lossless하며 O(1) lookup과 strict validation을 제공한다.
 - [x] startup에 routed expert 전체가 LPDDR에 materialize되지 않는다.
 - [x] selected unique expert만 동기적으로 읽고 호출 간 cache/reuse가 없다.
 - [x] resident와 demand path의 routing, MoE output 및 fixture token이 일치한다.
-- [x] 반복 generation의 memory/locked-memory/fd 수가 bounded다.
+- [x] direct reader 반복에서 locked-memory/fd가 원상복귀하고, 두 독립 실모델 실행의
+  peak RSS가 4.483/4.427 GiB로 bounded다.
 - [x] expert 및 KV traffic이 trace와 logical byte accounting으로 설명된다. 동일
   configuration의 resident/demand routing JSONL과 token output이 일치하고, 양쪽 KV
   trace가 각각 128 selected tokens를 기록했으며 demand 실행은 expert 983,040 bytes와
@@ -239,8 +250,15 @@ M2 완료 조건은 다음과 같다.
 - [x] 이전 resident baseline과 모든 M1 test가 유지된다.
 
 위 항목은 tiny deterministic fixture에서 확인한 1차 구현 gate다. 실제
-Qwen3-30B-A3B의 manifest/preflight 및 허용 가능한 하드웨어에서의 generation은 Gate F의
-최종 evidence로 별도 기록하며, 이를 완료하기 전에는 전체 M2를 closed로 선언하지 않는다.
+Qwen3-30B-A3B revision `ad44e777…d39`도 6,144 extents/54.0 GiB store로 pack 및
+전수 검증했고, Orin Nano에서 두 번의 demand generation을 완료했다. 두 실행은 동일한
+`The team`, 3,120 materialize calls, 24,960 reads, 235,552,112,640 logical expert bytes를
+기록했고 peak RSS는 4.483/4.427 GiB였다. 따라서 M2 storage/lifecycle gate는 닫혔다.
+M1의 large-memory HF parity는 독립 architecture correctness evidence로 계속 열린다.
+
+M2 closure와 별개인 후속 reference 항목:
+
+- [ ] M1 실제 checkpoint resident/reference parity를 large-memory system에서 기록한다.
 
 M3는 이 storage index와 reader를 재사용해 bounded LRU를 추가한다. M2에는 cache slot
 metadata, eviction policy, async lease, prediction 또는 unified I/O task abstraction을

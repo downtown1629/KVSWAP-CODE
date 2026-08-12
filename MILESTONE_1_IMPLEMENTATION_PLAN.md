@@ -236,6 +236,11 @@ MEMORY_ALLOC: object=router|expert|workspace, layer, bytes, dtype
 - [x] expert I/O/cache/prefetch 코드가 M1에 섞이지 않았다.
 - [x] shard open 전 resident capacity estimate와 fixture peak usage 및 재현 명령이 보존되었다.
 
+상태 해석: M1 fixture integration과 KVSwap regression은 closed다. 실제 checkpoint의
+resident/HF parity는 large-memory reference system이 필요한 독립 open item이며, Orin의
+M2 synchronous storage/lifecycle closure를 막지 않는다. 전체 architecture correctness는
+이 parity evidence 전까지 closed로 부르지 않는다.
+
 모든 항목을 통과해야 Qwen3-MoE M1을 완료한 것으로 본다. 다음 우선순위는 Qwen3-MoE의 실제 Jetson synchronous demand loading(M2)이며, 가능하면 bounded cache(M3)까지 vertical slice를 확보한 뒤 아래 architecture 확장을 시작한다. 추가 모델에는 각자의 resident-parity gate를 통과하기 전 expert offloading을 활성화하지 않는다.
 
 ## 10. Qwen3-MoE 성공 이후 architecture 확장

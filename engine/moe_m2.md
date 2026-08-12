@@ -10,7 +10,8 @@ next call. There is no expert cache, prefetch, overlap, quantization, or reuse.
 
 `scripts/pack_qwen3_moe_experts.py` streams BF16 gate/up/down tensors into one
 4096-byte-aligned extent per `(layer, expert)`. `manifest.json` records a config
-fingerprint, exact shapes and byte ranges, source revision, and per-expert
+fingerprint, exact shapes and byte ranges, source revision, a canonical SHA-256
+over every checkpoint tensor's metadata and bytes, and per-expert
 SHA-256. Startup validates coverage, overlap, alignment, file bounds, shapes,
 representation, and an explicitly supplied immutable checkpoint revision before
 CUDA allocation. Offline verification
@@ -39,7 +40,9 @@ calls, 20 cold expert reads, and 983,040 logical bytes; direct mode used 1.526
 GiB peak RSS. The strengthened joint direct-I/O gate compares resident/demand
 routing JSONL, output tokens, and both KV traces. It selected 128 KV tokens and
 accounted for 983,040 expert bytes plus 32,768 KV bytes while preserving
-`token_99 token_8`. These fixture figures validate correctness and lifecycle, not
+`token_99 token_8`. The wrapper also rejects a joint run unless the expert store
+and KV offload directories have the same filesystem device ID. These fixture
+figures validate correctness and lifecycle, not
 performance.
 
 For a real store, pack on a host with sufficient storage:
@@ -54,3 +57,12 @@ PYTHONPATH=src .venv/bin/python scripts/pack_qwen3_moe_experts.py \
 Real execution additionally requires `--expert_mode demand`, the store path,
 an explicit fixed+scratch approval limit, and a conservative slot/chunk choice.
 Do not bypass a failed capacity preflight on memory-constrained Jetson systems.
+
+Qwen3-30B-A3B revision `ad44e777…d39` was packed into 6,144 verified extents
+(54.0 GiB expert data) and bound to full checkpoint digest `830442e…97b7e`. Two
+independent Orin Nano runs at prompt 64, batch one, decode two both produced
+`The team`. Each made 3,120 materialize calls and 24,960 cold expert reads for
+235,552,112,640 logical bytes. Peak RSS was 4.483 and 4.427 GiB respectively;
+Torch peak allocation/reservation was 2.962/2.971 GiB in both runs. This closes
+the real demand-loading and bounded-memory gate; large-memory HF parity remains
+an architecture/reference gate rather than an SSD-demand lifecycle gate.

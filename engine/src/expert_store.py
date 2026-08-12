@@ -120,6 +120,26 @@ def qwen3_moe_largest_fixed_tensor_bytes(config, dtype=torch.bfloat16):
     )
 
 
+def qwen3_checkpoint_digest(checkpoint, config, dtype=torch.bfloat16):
+    """Stream a canonical digest over every checkpoint tensor and its metadata."""
+    from moe_weights import qwen3_moe_resident_expected
+
+    expected = qwen3_moe_resident_expected(config, dtype=dtype)
+    checkpoint.validate(expected)
+    digest = hashlib.sha256()
+    for name in sorted(expected):
+        spec = checkpoint.tensor_specs[name]
+        digest.update(name.encode("utf-8") + b"\0")
+        digest.update(spec.dtype.encode("ascii") + b"\0")
+        digest.update(json.dumps(spec.shape).encode("ascii") + b"\0")
+        with safe_open(str(spec.shard), framework="pt", device="cpu") as handle:
+            tensor = handle.get_tensor(name)
+        raw = tensor.contiguous().view(torch.uint8).numpy()
+        digest.update(raw)
+        del tensor, raw
+    return digest.hexdigest()
+
+
 def estimate_qwen3_moe_demand_memory(
     config,
     scratch_slots,
@@ -196,7 +216,8 @@ class ExpertExtent:
 class ExpertStore:
     """Strictly validated read-only expert extent index."""
 
-    def __init__(self, root, config=None, expected_source_revision=None):
+    def __init__(self, root, config=None, expected_source_revision=None,
+                 expected_checkpoint_digest=None):
         self.root = Path(root)
         manifest_path = self.root / "manifest.json"
         try:
@@ -218,6 +239,21 @@ class ExpertStore:
                 "expert store source revision mismatch: "
                 f"store={self.source_revision!r}, checkpoint={expected_source_revision!r}"
             )
+        self.checkpoint_digest = manifest.get("checkpoint_sha256")
+        if (
+            not isinstance(self.checkpoint_digest, str)
+            or len(self.checkpoint_digest) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.checkpoint_digest
+            )
+        ):
+            raise ValueError("expert store checkpoint digest is invalid")
+        if (
+            expected_checkpoint_digest is not None
+            and self.checkpoint_digest != expected_checkpoint_digest
+        ):
+            raise ValueError("expert store checkpoint digest mismatch")
         self.alignment = manifest.get("alignment")
         _align_up(0, self.alignment)
         if config is not None:
@@ -398,6 +434,7 @@ def pack_qwen3_expert_store(checkpoint, config, output_dir, alignment=DEFAULT_AL
             for name, shape in qwen3_expert_component_specs(config, layer_id, expert_id):
                 expected[name] = (shape, torch.bfloat16)
     checkpoint.validate(expected)
+    checkpoint_digest = qwen3_checkpoint_digest(checkpoint, config)
 
     data_name = "experts-000.bin"
     temporary = output_dir / f".{data_name}.tmp-{os.getpid()}"
@@ -475,6 +512,7 @@ def pack_qwen3_expert_store(checkpoint, config, output_dir, alignment=DEFAULT_AL
             "config": identity,
             "config_fingerprint": fingerprint,
             "source_revision": source_revision,
+            "checkpoint_sha256": checkpoint_digest,
             "extents": extents,
         }
         manifest_tmp = output_dir / f".manifest.json.tmp-{os.getpid()}"
@@ -496,7 +534,8 @@ def pack_qwen3_expert_store(checkpoint, config, output_dir, alignment=DEFAULT_AL
             manifest_tmp.unlink()
         raise
     return ExpertStore(
-        output_dir, config=config, expected_source_revision=source_revision
+        output_dir, config=config, expected_source_revision=source_revision,
+        expected_checkpoint_digest=checkpoint_digest,
     )
 
 
@@ -514,6 +553,7 @@ class SynchronousExtentReader:
             raise OSError("O_DIRECT is unavailable on this platform")
         self.fd = os.open(self.path, flags)
         self.ring = None
+        self.ring_initialized = False
         self.cqe = None
         self._liburing = None
         try:
@@ -525,9 +565,10 @@ class SynchronousExtentReader:
                 result = liburing.io_uring_queue_init(2, self.ring)
                 if result != 0:
                     raise RuntimeError(f"io_uring_queue_init failed with {result}")
+                self.ring_initialized = True
                 self.cqe = liburing.io_uring_cqe()
         except Exception:
-            if self.ring is not None and self._liburing is not None:
+            if self.ring_initialized:
                 self._liburing.io_uring_queue_exit(self.ring)
             os.close(self.fd)
             self.fd = None
@@ -620,7 +661,7 @@ class SynchronousExtentReader:
         return memoryview(self.buffer)[:logical_bytes]
 
     def close(self):
-        if self.fd is None:
+        if self.fd is None and self.ring is None and self.buffer is None:
             return
         error = None
         try:
@@ -629,13 +670,16 @@ class SynchronousExtentReader:
             error = caught
         finally:
             try:
-                if self.ring is not None:
+                if self.ring_initialized:
                     self._liburing.io_uring_queue_exit(self.ring)
+                    self.ring_initialized = False
+                if self.ring is not None:
                     self.ring = None
                     self.cqe = None
             finally:
-                fd, self.fd = self.fd, None
-                os.close(fd)
+                if self.fd is not None:
+                    fd, self.fd = self.fd, None
+                    os.close(fd)
         if error is not None:
             raise error
 

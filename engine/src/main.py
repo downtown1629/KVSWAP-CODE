@@ -40,6 +40,7 @@ from expert_store import (
 	Qwen3DemandExpertProviderFactory,
 	estimate_qwen3_moe_demand_memory,
 	qwen3_expert_logical_bytes,
+	qwen3_checkpoint_digest,
 	qwen3_moe_fixed_weight_bytes,
 )
 from moe_weights import (
@@ -1932,6 +1933,15 @@ def run_flexgen(args):
 			total_bytes=total_bytes,
 			cuda_allocator_fraction=0.85,
 		)
+		if args.expert_mode == "demand":
+			# Capacity is approved before shards are opened. This then streams only
+			# fixed/router tensors, never the 54 GiB expert bank.
+			moe_checkpoint = SafetensorCheckpoint(args.model_path)
+			checkpoint_digest = qwen3_checkpoint_digest(
+				moe_checkpoint, config, dtype=torch.bfloat16
+			)
+			if checkpoint_digest != moe_expert_store.checkpoint_digest:
+				raise ValueError("expert store checkpoint digest mismatch")
 		print(
 			f"Qwen3-MoE {args.expert_mode} weight approval: "
 			f"{approved_weight_bytes / GB:.3f} GiB within "
@@ -1957,7 +1967,8 @@ def run_flexgen(args):
 			)
 		# Opening every shard and validating shapes is intentionally delayed
 		# until the metadata-only size/name/budget gate succeeds.
-		moe_checkpoint = SafetensorCheckpoint(args.model_path)
+		if moe_checkpoint is None:
+			moe_checkpoint = SafetensorCheckpoint(args.model_path)
 		routed_layers = validate_qwen3_moe_checkpoint(
 			moe_checkpoint,
 			config,

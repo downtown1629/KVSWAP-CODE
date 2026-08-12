@@ -4,7 +4,11 @@
 import argparse
 import json
 
-from expert_store import ExpertStore, pack_qwen3_expert_store
+from expert_store import (
+    ExpertStore,
+    pack_qwen3_expert_store,
+    qwen3_checkpoint_digest,
+)
 from model_config import get_model_config
 from moe_weights import SafetensorCheckpoint
 
@@ -32,10 +36,14 @@ def main():
         )
         print(json.dumps({"extents": len(store.extents), "store": str(store.root)}))
     else:
+        checkpoint = SafetensorCheckpoint(args.checkpoint)
         store = ExpertStore(
             args.store,
             config=config,
             expected_source_revision=args.source_revision,
+            expected_checkpoint_digest=qwen3_checkpoint_digest(
+                checkpoint, config
+            ),
         )
         count = store.verify_checksums()
         print(json.dumps({"verified_extents": count, "store": str(store.root)}))
