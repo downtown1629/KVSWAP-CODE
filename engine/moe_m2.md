@@ -12,7 +12,8 @@ next call. There is no expert cache, prefetch, overlap, quantization, or reuse.
 4096-byte-aligned extent per `(layer, expert)`. `manifest.json` records a config
 fingerprint, exact shapes and byte ranges, source revision, and per-expert
 SHA-256. Startup validates coverage, overlap, alignment, file bounds, shapes,
-representation, and model identity before CUDA allocation. Offline verification
+representation, and an explicitly supplied immutable checkpoint revision before
+CUDA allocation. Offline verification
 rehashes every extent.
 
 The Jetson backend uses `O_DIRECT`, a reusable page-aligned CUDA-registered host
@@ -35,9 +36,10 @@ bash scripts/eval_moe_m2.sh fixture-kvswap
 On Orin Nano, buffered and direct full-KV runs reproduced the M1/HF fixture
 output `token_99 token_8`. With a 16-token chunk, each performed 10 materialize
 calls, 20 cold expert reads, and 983,040 logical bytes; direct mode used 1.526
-GiB peak RSS. The joint direct-I/O run also selected 128 KV tokens while keeping
-the same output, used 1.547 GiB peak RSS, and preserved separate expert/KV byte
-accounting. These fixture figures validate correctness and lifecycle, not
+GiB peak RSS. The strengthened joint direct-I/O gate compares resident/demand
+routing JSONL, output tokens, and both KV traces. It selected 128 KV tokens and
+accounted for 983,040 expert bytes plus 32,768 KV bytes while preserving
+`token_99 token_8`. These fixture figures validate correctness and lifecycle, not
 performance.
 
 For a real store, pack on a host with sufficient storage:
@@ -46,7 +48,7 @@ For a real store, pack on a host with sufficient storage:
 PYTHONPATH=src .venv/bin/python scripts/pack_qwen3_moe_experts.py \
   pack /models/Qwen3-30B-A3B /nvme/qwen3-30b-experts --source-revision REV
 PYTHONPATH=src .venv/bin/python scripts/pack_qwen3_moe_experts.py \
-  verify /models/Qwen3-30B-A3B /nvme/qwen3-30b-experts
+  verify /models/Qwen3-30B-A3B /nvme/qwen3-30b-experts --source-revision REV
 ```
 
 Real execution additionally requires `--expert_mode demand`, the store path,

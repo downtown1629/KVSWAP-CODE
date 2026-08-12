@@ -224,13 +224,18 @@ bash scripts/eval_moe_m2.sh real-demand          # explicit memory approval requ
 
 M2 완료 조건은 다음과 같다.
 
-- [x] M1의 resident/KVSwap/dense 선행 gate가 닫혔다.
+- [x] M1의 fixture resident/KVSwap 및 dense regression 선행 gate가 닫혔다.
+- [ ] M1 실제 checkpoint resident/reference parity는 large-memory system evidence가
+  필요하며 M2 Gate F와 함께 열린 상태다.
 - [x] expert store가 lossless하며 O(1) lookup과 strict validation을 제공한다.
 - [x] startup에 routed expert 전체가 LPDDR에 materialize되지 않는다.
 - [x] selected unique expert만 동기적으로 읽고 호출 간 cache/reuse가 없다.
 - [x] resident와 demand path의 routing, MoE output 및 fixture token이 일치한다.
 - [x] 반복 generation의 memory/locked-memory/fd 수가 bounded다.
-- [x] expert 및 KV traffic이 trace와 byte accounting으로 설명된다.
+- [x] expert 및 KV traffic이 trace와 logical byte accounting으로 설명된다. 동일
+  configuration의 resident/demand routing JSONL과 token output이 일치하고, 양쪽 KV
+  trace가 각각 128 selected tokens를 기록했으며 demand 실행은 expert 983,040 bytes와
+  KV 32,768 bytes를 합산 검증했다.
 - [x] 이전 resident baseline과 모든 M1 test가 유지된다.
 
 위 항목은 tiny deterministic fixture에서 확인한 1차 구현 gate다. 실제

@@ -6,6 +6,8 @@ interface.
 """
 
 from dataclasses import dataclass
+import json
+from pathlib import Path
 from typing import Protocol
 
 import torch
@@ -90,6 +92,30 @@ class ResidentExpertProvider:
                     f"selected expert IDs [{min_id}, {max_id}] are outside the resident bank"
                 )
         return self.experts
+
+
+class TracingExpertProvider:
+    """Optional JSONL routing trace without changing storage semantics."""
+
+    def __init__(self, provider, layer_id, trace_path):
+        self.provider = provider
+        self.layer_id = int(layer_id)
+        self.trace_path = Path(trace_path)
+        self.call_id = 0
+
+    def materialize(self, selected_expert_ids):
+        selected = selected_expert_ids.detach().to("cpu")
+        record = {
+            "event": "EXPERT_MATERIALIZE",
+            "layer": self.layer_id,
+            "call": self.call_id,
+            "selected_ids": selected.tolist(),
+            "unique_ids": sorted(int(value) for value in torch.unique(selected).tolist()),
+        }
+        with self.trace_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+        self.call_id += 1
+        return self.provider.materialize(selected_expert_ids)
 
 
 @dataclass(frozen=True)

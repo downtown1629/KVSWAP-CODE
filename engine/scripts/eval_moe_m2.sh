@@ -15,13 +15,16 @@ make_artifacts() {
     PYTHONPATH=src "$PYTHON" scripts/pack_qwen3_moe_experts.py \
         pack "$FIXTURE_DIR" "$STORE_DIR" --source-revision m2-fixture
     PYTHONPATH=src "$PYTHON" scripts/pack_qwen3_moe_experts.py \
-        verify "$FIXTURE_DIR" "$STORE_DIR"
+        verify "$FIXTURE_DIR" "$STORE_DIR" --source-revision m2-fixture
 }
 
 run_fixture() {
     local reader=$1
     local kvswap=$2
     local run_log=$3
+    local expert_mode=${4:-demand}
+    local run_info=${5:-none}
+    local expert_trace=${6:-none}
     local offload_dir
     offload_dir=$(mktemp -d /tmp/kvswap-qwen3-moe-m2-offload.XXXXXX)
     local kv_args=(
@@ -38,6 +41,20 @@ run_fixture() {
             --run_args L4 --lr_proj_mode lr_proj_mh --lr_proj_path "$ADAPTER_DIR"
             --dk_rd clear --max_num_kv 64 --token_group 2
             --start_layer 0-curr-emb --reuse_budget 0 --flash_att 0 --paged_att 1
+            --run_info "$run_info"
+        )
+    fi
+    local expert_args=(
+        --expert_mode demand --moe_expert_store "$STORE_DIR"
+        --moe_checkpoint_revision m2-fixture
+        --moe_expert_reader "$reader" --moe_expert_scratch_slots 8
+        --moe_expert_verify_reads 1 --moe_demand_weight_limit_gb 0.01
+        --moe_expert_trace "$expert_trace"
+    )
+    if [[ "$expert_mode" == resident ]]; then
+        expert_args=(
+            --expert_mode resident --moe_resident_weight_limit_gb 0.01
+            --moe_expert_trace "$expert_trace"
         )
     fi
     MAX_ALLOC_KV_SIZE=67108864 "$PYTHON" src/main.py \
@@ -45,13 +62,13 @@ run_fixture() {
         --prompt_len 64 --gen_len 2 --gpu_batch_size 1 --num_gpu_batches 1 \
         --test_input_path ./data/test_inputs --use_token_cache 0 --dk_wr none \
         --disk_dev_name nvme --batch_split 1 --seed 1234 --nv_profile 0 \
-        --expert_mode demand --moe_expert_store "$STORE_DIR" \
-        --moe_expert_reader "$reader" --moe_expert_scratch_slots 8 \
-        --moe_expert_verify_reads 1 \
-        --moe_demand_weight_limit_gb 0.01 --moe_system_headroom_gb 1 \
-        --moe_token_chunk_size 16 "${kv_args[@]}" >"$run_log" 2>&1
+        --moe_system_headroom_gb 1 --moe_token_chunk_size 16 \
+        "${expert_args[@]}" "${kv_args[@]}" >"$run_log" 2>&1
     cat "$run_log"
     grep -Fqx "0: token_99 token_8" "$run_log"
+    if [[ "$expert_mode" == resident ]]; then
+        return
+    fi
     "$PYTHON" - "$run_log" <<'PY'
 import re
 import sys
@@ -97,11 +114,62 @@ case "$MODE" in
     fixture-kvswap)
         free -h
         make_artifacts
-        RUN_LOG=$(mktemp /tmp/kvswap-qwen3-moe-m2-kvswap.XXXXXX)
-        run_fixture direct 1 "$RUN_LOG"
+        RESIDENT_LOG=$(mktemp /tmp/kvswap-qwen3-moe-m2-resident-kvswap.XXXXXX)
+        DEMAND_LOG=$(mktemp /tmp/kvswap-qwen3-moe-m2-demand-kvswap.XXXXXX)
+        TRACE_DIR=$(mktemp -d /tmp/kvswap-qwen3-moe-m2-trace.XXXXXX)
+        run_fixture direct 1 "$RESIDENT_LOG" resident \
+            "$TRACE_DIR/resident" "$TRACE_DIR/resident-experts.jsonl"
+        run_fixture direct 1 "$DEMAND_LOG" demand \
+            "$TRACE_DIR/demand" "$TRACE_DIR/demand-experts.jsonl"
+        "$PYTHON" - "$TRACE_DIR" "$DEMAND_LOG" <<'PY'
+import json
+import re
+import sys
+import torch
+from pathlib import Path
+
+root = Path(sys.argv[1])
+resident = [json.loads(line) for line in (root / "resident-experts.jsonl").open()]
+demand = [json.loads(line) for line in (root / "demand-experts.jsonl").open()]
+if resident != demand:
+    raise SystemExit("resident/demand routing traces differ")
+for name in ("resident", "demand"):
+    trace = torch.load(root / f"{name}_swap_info.pt", map_location="cpu", weights_only=False)
+    selected = sum(int(item[1].sum()) for item in trace)
+    if selected != 128:
+        raise SystemExit(f"{name} KV selected tokens: expected 128, got {selected}")
+text = Path(sys.argv[2]).read_text()
+match = re.search(r"logical_bytes=(\d+)", text)
+expert_bytes = int(match.group(1))
+kv_bytes = 128 * 2 * 1 * 64 * 2
+print(f"Joint logical I/O verified: expert={expert_bytes}, KV={kv_bytes}, total={expert_bytes + kv_bytes}")
+PY
+        ;;
+    real-demand)
+        : "${M2_MODEL_PATH:?set M2_MODEL_PATH to the Qwen3-MoE checkpoint}"
+        : "${M2_EXPERT_STORE:?set M2_EXPERT_STORE to the packed expert store}"
+        : "${M2_CHECKPOINT_REVISION:?set M2_CHECKPOINT_REVISION to its immutable revision}"
+        free -h
+        RUN_LOG=$(mktemp /tmp/kvswap-qwen3-moe-m2-real.XXXXXX)
+        OFFLOAD_DIR=$(mktemp -d /tmp/kvswap-qwen3-moe-m2-real-offload.XXXXXX)
+        MAX_ALLOC_KV_SIZE=67108864 "$PYTHON" src/main.py \
+            --model_path "$M2_MODEL_PATH" --offload_dir "$OFFLOAD_DIR" \
+            --prompt_len 64 --gen_len 2 --gpu_batch_size 1 --num_gpu_batches 1 \
+            --percent 100 0 100 0 100 0 --test_input_path ./data/test_inputs \
+            --run_args L0 --lr_proj_mode none --use_token_cache 0 \
+            --dk_wr none --dk_rd none --token_group 1 --disk_dev_name nvme \
+            --batch_split 1 --seed 1234 --flash_att 1 --paged_att 0 --nv_profile 0 \
+            --expert_mode demand --moe_expert_store "$M2_EXPERT_STORE" \
+            --moe_checkpoint_revision "$M2_CHECKPOINT_REVISION" \
+            --moe_expert_reader direct --moe_expert_scratch_slots 8 \
+            --moe_demand_weight_limit_gb 4 --moe_system_headroom_gb 1.5 \
+            --moe_token_chunk_size 1 >"$RUN_LOG" 2>&1
+        cat "$RUN_LOG"
+        grep -q "Expert demand I/O: calls=" "$RUN_LOG"
+        grep -q "Peak Memory (GB)" "$RUN_LOG"
         ;;
     *)
-        echo "usage: $0 {static|fixture-buffered|fixture-direct|fixture-fullkv|fixture-kvswap}" >&2
+        echo "usage: $0 {static|fixture-buffered|fixture-direct|fixture-fullkv|fixture-kvswap|real-demand}" >&2
         exit 2
         ;;
 esac

@@ -107,6 +107,19 @@ def qwen3_moe_fixed_weight_bytes(config, dtype=torch.bfloat16):
     return total
 
 
+def qwen3_moe_largest_fixed_tensor_bytes(config, dtype=torch.bfloat16):
+    from moe_weights import qwen3_moe_resident_expected
+
+    element_size = torch.empty((), dtype=dtype).element_size()
+    return max(
+        math.prod(shape) * element_size
+        for name, (shape, _) in qwen3_moe_resident_expected(
+            config, dtype=dtype
+        ).items()
+        if ".mlp.experts." not in name
+    )
+
+
 def estimate_qwen3_moe_demand_memory(
     config,
     scratch_slots,
@@ -144,7 +157,10 @@ def estimate_qwen3_moe_demand_memory(
     )
     scratch = scratch_slots * qwen3_expert_logical_bytes(config)
     fixed = qwen3_moe_fixed_weight_bytes(config, dtype=dtype)
-    staging = _align_up(qwen3_expert_logical_bytes(config), alignment)
+    staging = max(
+        _align_up(qwen3_expert_logical_bytes(config), alignment),
+        qwen3_moe_largest_fixed_tensor_bytes(config, dtype=dtype),
+    )
     return ResidentMemoryPlan(
         weights=fixed + scratch,
         memory_kv=resident_shape.memory_kv,
@@ -180,7 +196,7 @@ class ExpertExtent:
 class ExpertStore:
     """Strictly validated read-only expert extent index."""
 
-    def __init__(self, root, config=None):
+    def __init__(self, root, config=None, expected_source_revision=None):
         self.root = Path(root)
         manifest_path = self.root / "manifest.json"
         try:
@@ -191,6 +207,17 @@ class ExpertStore:
             raise ValueError(f"unsupported expert store format: {manifest.get('format')!r}")
         if manifest.get("representation") != REPRESENTATION:
             raise ValueError("M2 supports only lossless BF16 expert stores")
+        self.source_revision = manifest.get("source_revision")
+        if not isinstance(self.source_revision, str) or not self.source_revision.strip():
+            raise ValueError("expert store source_revision must be a non-empty string")
+        if (
+            expected_source_revision is not None
+            and self.source_revision != expected_source_revision
+        ):
+            raise ValueError(
+                "expert store source revision mismatch: "
+                f"store={self.source_revision!r}, checkpoint={expected_source_revision!r}"
+            )
         self.alignment = manifest.get("alignment")
         _align_up(0, self.alignment)
         if config is not None:
@@ -227,6 +254,8 @@ class ExpertStore:
                 if end > file_size:
                     raise ValueError(f"expert extent {key} exceeds {filename} size")
                 previous_end = end
+        if set(file_ranges) != {"experts-000.bin"}:
+            raise ValueError("M2 v1 requires exactly one experts-000.bin data file")
 
         if config is not None:
             expected = {
@@ -273,7 +302,11 @@ class ExpertStore:
             raise ValueError("stored expert extent is shorter than logical data")
         if not isinstance(raw["file"], str) or Path(raw["file"]).name != raw["file"]:
             raise ValueError("expert data file must be a basename")
-        if not isinstance(raw["checksum"], str) or len(raw["checksum"]) != 64:
+        if (
+            not isinstance(raw["checksum"], str)
+            or len(raw["checksum"]) != 64
+            or any(character not in "0123456789abcdef" for character in raw["checksum"])
+        ):
             raise ValueError("expert checksum must be SHA-256 hex")
 
         components = []
@@ -292,6 +325,15 @@ class ExpertStore:
                 raise ValueError("expert component shape is invalid")
             offset = raw_component["offset"]
             length = raw_component["length"]
+            if (
+                not isinstance(offset, int)
+                or isinstance(offset, bool)
+                or not isinstance(length, int)
+                or isinstance(length, bool)
+                or offset < 0
+                or length <= 0
+            ):
+                raise ValueError("expert component byte range type is invalid")
             if offset != expected_offset or length != math.prod(shape) * 2:
                 raise ValueError("expert component byte range is invalid")
             components.append(ExpertComponent(expected_name, tuple(shape), offset, length))
@@ -314,10 +356,12 @@ class ExpertStore:
         readers = {}
         try:
             for key, extent in sorted(self.extents.items()):
-                reader = readers.setdefault(
-                    extent.file,
-                    SynchronousExtentReader(self.root / extent.file, direct=False),
-                )
+                reader = readers.get(extent.file)
+                if reader is None:
+                    reader = SynchronousExtentReader(
+                        self.root / extent.file, direct=False
+                    )
+                    readers[extent.file] = reader
                 data = reader.read(extent.offset, extent.logical_bytes, extent.stored_bytes)
                 try:
                     actual = hashlib.sha256(data).hexdigest()
@@ -338,6 +382,8 @@ def pack_qwen3_expert_store(checkpoint, config, output_dir, alignment=DEFAULT_AL
     if output_dir.exists() and any(output_dir.iterdir()):
         raise FileExistsError(f"refusing to overwrite non-empty {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
+    if not isinstance(source_revision, str) or not source_revision.strip():
+        raise ValueError("source_revision must be a non-empty immutable revision")
     _align_up(0, alignment)
     routed_layers = qwen3_routed_layer_ids(config)
     if not routed_layers:
@@ -357,6 +403,7 @@ def pack_qwen3_expert_store(checkpoint, config, output_dir, alignment=DEFAULT_AL
     temporary = output_dir / f".{data_name}.tmp-{os.getpid()}"
     final_data = output_dir / data_name
     extents = []
+    published_data = False
     try:
         with open(temporary, "xb", buffering=0) as output:
             for layer_id in routed_layers:
@@ -377,7 +424,8 @@ def pack_qwen3_expert_store(checkpoint, config, output_dir, alignment=DEFAULT_AL
                         if tensor.dtype != torch.bfloat16 or tuple(tensor.shape) != tuple(shape):
                             raise ValueError(f"source tensor changed after validation: {name}")
                         raw = tensor.contiguous().view(torch.uint8).numpy().tobytes()
-                        output.write(raw)
+                        if output.write(raw) != len(raw):
+                            raise OSError(f"short expert store write for {name}")
                         digest.update(raw)
                         components.append({
                             "name": component,
@@ -388,7 +436,9 @@ def pack_qwen3_expert_store(checkpoint, config, output_dir, alignment=DEFAULT_AL
                         component_offset += len(raw)
                         del tensor, raw
                     stored_bytes = _align_up(component_offset, alignment)
-                    output.write(b"\0" * (stored_bytes - component_offset))
+                    padding = b"\0" * (stored_bytes - component_offset)
+                    if output.write(padding) != len(padding):
+                        raise OSError("short expert store padding write")
                     extents.append({
                         "layer_id": layer_id,
                         "expert_id": expert_id,
@@ -401,7 +451,22 @@ def pack_qwen3_expert_store(checkpoint, config, output_dir, alignment=DEFAULT_AL
                     })
             output.flush()
             os.fsync(output.fileno())
+        with SynchronousExtentReader(temporary, direct=False) as verifier:
+            for raw_extent in extents:
+                data = verifier.read(
+                    raw_extent["offset"], raw_extent["logical_bytes"],
+                    raw_extent["stored_bytes"],
+                )
+                try:
+                    if hashlib.sha256(data).hexdigest() != raw_extent["checksum"]:
+                        raise OSError(
+                            "packed expert bytes failed verification for "
+                            f"({raw_extent['layer_id']}, {raw_extent['expert_id']})"
+                        )
+                finally:
+                    data.release()
         os.replace(temporary, final_data)
+        published_data = True
         identity, fingerprint = _config_identity(config)
         manifest = {
             "format": FORMAT_VERSION,
@@ -425,8 +490,14 @@ def pack_qwen3_expert_store(checkpoint, config, output_dir, alignment=DEFAULT_AL
     except Exception:
         if temporary.exists():
             temporary.unlink()
+        if published_data and final_data.exists() and not (output_dir / "manifest.json").exists():
+            final_data.unlink()
+        for manifest_tmp in output_dir.glob(".manifest.json.tmp-*"):
+            manifest_tmp.unlink()
         raise
-    return ExpertStore(output_dir, config=config)
+    return ExpertStore(
+        output_dir, config=config, expected_source_revision=source_revision
+    )
 
 
 class SynchronousExtentReader:
@@ -445,17 +516,22 @@ class SynchronousExtentReader:
         self.ring = None
         self.cqe = None
         self._liburing = None
-        if self.direct:
-            import liburing
+        try:
+            if self.direct:
+                import liburing
 
-            self._liburing = liburing
-            self.ring = liburing.io_uring()
-            result = liburing.io_uring_queue_init(2, self.ring)
-            if result != 0:
-                os.close(self.fd)
-                self.fd = None
-                raise RuntimeError(f"io_uring_queue_init failed with {result}")
-            self.cqe = liburing.io_uring_cqe()
+                self._liburing = liburing
+                self.ring = liburing.io_uring()
+                result = liburing.io_uring_queue_init(2, self.ring)
+                if result != 0:
+                    raise RuntimeError(f"io_uring_queue_init failed with {result}")
+                self.cqe = liburing.io_uring_cqe()
+        except Exception:
+            if self.ring is not None and self._liburing is not None:
+                self._liburing.io_uring_queue_exit(self.ring)
+            os.close(self.fd)
+            self.fd = None
+            raise
         self.buffer = None
         self.capacity = 0
         self._registered_address = None
@@ -516,10 +592,12 @@ class SynchronousExtentReader:
                 self._liburing.io_uring_prep_read(
                     sqe, self.fd, target, stored_bytes, offset
                 )
-                submitted = self._liburing.io_uring_submit(self.ring)
+                with nvtx.annotate("EXPERT_READ_SUBMIT", color="orange"):
+                    submitted = self._liburing.io_uring_submit(self.ring)
                 if submitted != 1:
                     raise RuntimeError(f"io_uring submitted {submitted}, expected 1")
-                result = self._liburing.io_uring_wait_cqe(self.ring, self.cqe)
+                with nvtx.annotate("EXPERT_READ_COMPLETE", color="yellow"):
+                    result = self._liburing.io_uring_wait_cqe(self.ring, self.cqe)
                 if result != 0:
                     raise RuntimeError(f"io_uring_wait_cqe failed with {result}")
                 count = int(self.cqe.res)
@@ -544,13 +622,22 @@ class SynchronousExtentReader:
     def close(self):
         if self.fd is None:
             return
-        self._release_buffer()
-        if self.ring is not None:
-            self._liburing.io_uring_queue_exit(self.ring)
-            self.ring = None
-            self.cqe = None
-        os.close(self.fd)
-        self.fd = None
+        error = None
+        try:
+            self._release_buffer()
+        except Exception as caught:
+            error = caught
+        finally:
+            try:
+                if self.ring is not None:
+                    self._liburing.io_uring_queue_exit(self.ring)
+                    self.ring = None
+                    self.cqe = None
+            finally:
+                fd, self.fd = self.fd, None
+                os.close(fd)
+        if error is not None:
+            raise error
 
     def __enter__(self):
         return self
@@ -631,50 +718,58 @@ class SharedExpertWorkspace:
                 )
             read_elapsed = time.perf_counter() - read_start
             self.read_seconds += read_elapsed
-            if self.verify_reads and hashlib.sha256(raw).hexdigest() != extent.checksum:
+            try:
+                if (
+                    self.verify_reads
+                    and hashlib.sha256(raw).hexdigest() != extent.checksum
+                ):
+                    raise ValueError(
+                        f"expert checksum mismatch for ({layer_id}, {expert_id})"
+                    )
+                copy_start = time.perf_counter()
+                with nvtx.annotate(
+                    f"EXPERT_COPY layer={layer_id} expert={expert_id}", color="blue"
+                ):
+                    destinations = (
+                        self.gate_proj[slot], self.up_proj[slot],
+                        self.down_proj[slot],
+                    )
+                    for component, destination in zip(extent.components, destinations):
+                        component_view = raw[
+                            component.offset : component.offset + component.length
+                        ]
+                        try:
+                            source = torch.frombuffer(
+                                component_view, dtype=torch.bfloat16
+                            ).reshape(component.shape)
+                            destination.copy_(source, non_blocking=False)
+                            del source
+                        finally:
+                            component_view.release()
+                    if self.device.type == "cuda":
+                        torch.cuda.current_stream(self.device).synchronize()
+                copy_elapsed = time.perf_counter() - copy_start
+            finally:
                 raw.release()
-                raise ValueError(f"expert checksum mismatch for ({layer_id}, {expert_id})")
-            copy_start = time.perf_counter()
-            with nvtx.annotate(
-                f"EXPERT_COPY layer={layer_id} expert={expert_id}", color="blue"
-            ):
-                destinations = (
-                    self.gate_proj[slot], self.up_proj[slot], self.down_proj[slot]
-                )
-                for component, destination in zip(extent.components, destinations):
-                    component_view = raw[
-                        component.offset : component.offset + component.length
-                    ]
-                    source = torch.frombuffer(
-                        component_view, dtype=torch.bfloat16
-                    ).reshape(component.shape)
-                    destination.copy_(source, non_blocking=False)
-                    del source, component_view
-                if self.device.type == "cuda":
-                    torch.cuda.current_stream(self.device).synchronize()
-            copy_elapsed = time.perf_counter() - copy_start
             self.copy_seconds += copy_elapsed
             self.global_ids[slot] = expert_id
-            raw.release()
             stats = self.layer_stats.setdefault(
                 int(layer_id),
                 {"calls": 0, "reads": 0, "logical_bytes": 0,
                  "stored_bytes": 0, "read_seconds": 0.0,
-                 "copy_seconds": 0.0, "expert_reads": {}},
+                 "copy_seconds": 0.0},
             )
             stats["reads"] += 1
             stats["logical_bytes"] += extent.logical_bytes
             stats["stored_bytes"] += extent.stored_bytes
             stats["read_seconds"] += read_elapsed
             stats["copy_seconds"] += copy_elapsed
-            expert_reads = stats["expert_reads"]
-            expert_reads[expert_id] = expert_reads.get(expert_id, 0) + 1
         self.materialize_calls += 1
         self.layer_stats.setdefault(
             int(layer_id),
             {"calls": 0, "reads": 0, "logical_bytes": 0,
              "stored_bytes": 0, "read_seconds": 0.0,
-             "copy_seconds": 0.0, "expert_reads": {}},
+             "copy_seconds": 0.0},
         )["calls"] += 1
         count = len(unique_ids)
         return MaterializedExperts(

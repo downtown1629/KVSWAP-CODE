@@ -15,10 +15,11 @@ def main():
     pack = subparsers.add_parser("pack")
     pack.add_argument("checkpoint")
     pack.add_argument("output")
-    pack.add_argument("--source-revision")
+    pack.add_argument("--source-revision", required=True)
     verify = subparsers.add_parser("verify")
     verify.add_argument("checkpoint")
     verify.add_argument("store")
+    verify.add_argument("--source-revision", required=True)
     args = parser.parse_args()
 
     config = get_model_config(args.checkpoint)
@@ -31,7 +32,11 @@ def main():
         )
         print(json.dumps({"extents": len(store.extents), "store": str(store.root)}))
     else:
-        store = ExpertStore(args.store, config=config)
+        store = ExpertStore(
+            args.store,
+            config=config,
+            expected_source_revision=args.source_revision,
+        )
         count = store.verify_checksums()
         print(json.dumps({"verified_extents": count, "store": str(store.root)}))
 

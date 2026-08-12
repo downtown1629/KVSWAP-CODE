@@ -30,7 +30,11 @@ from model_utils import rms_norm
 import torch.nn.functional as F
 from cache_manager import CacheManager
 from model_adapters import FFNKind, get_ffn_kind, is_qwen3_family
-from moe import ResidentExpertProvider, qwen3_moe_layer_forward_chunked
+from moe import (
+	ResidentExpertProvider,
+	TracingExpertProvider,
+	qwen3_moe_layer_forward_chunked,
+)
 from expert_store import (
 	ExpertStore,
 	Qwen3DemandExpertProviderFactory,
@@ -1018,13 +1022,14 @@ class MoEBlock:
 	"""Qwen3-MoE FFN using a resident or synchronous-demand provider."""
 
 	def __init__(self, config, env, policy, layer_id, checkpoint,
-				 expert_provider_factory):
+				 expert_provider_factory, expert_trace_path="none"):
 		self.config = config
 		self.env = env
 		self.policy = policy
 		self.layer_id = layer_id
 		self.checkpoint = checkpoint
 		self.expert_provider_factory = expert_provider_factory
+		self.expert_trace_path = expert_trace_path
 		self.compute = self.env.gpu if self.env.gpu is not None else self.env.cpu
 		self.task = None
 		self.fixed_weights = None
@@ -1051,6 +1056,10 @@ class MoEBlock:
 		self.expert_provider = self.expert_provider_factory.create(
 			self.layer_id, self.compute.dev, torch.bfloat16
 		)
+		if self.expert_trace_path != "none":
+			self.expert_provider = TracingExpertProvider(
+				self.expert_provider, self.layer_id, self.expert_trace_path
+			)
 		# Resident weights are owned by this layer rather than the legacy
 		# TorchTensor weight movement path.
 		weight_home.store([])
@@ -1098,6 +1107,7 @@ class LM:
 				 lr_proj_path,
 				 moe_checkpoint=None,
 				 expert_provider_factory=None,
+				 expert_trace_path="none",
 				 ):
 		self.config = config
 		self.env = env
@@ -1129,6 +1139,7 @@ class LM:
 		
 		self.moe_checkpoint = moe_checkpoint
 		self.expert_provider_factory = expert_provider_factory
+		self.expert_trace_path = expert_trace_path
 		if self.config.model_type == 'qwen3_moe':
 			if self.moe_checkpoint is None:
 				raise ValueError("qwen3_moe requires a preflighted safetensors checkpoint")
@@ -1167,7 +1178,7 @@ class LM:
 			if get_ffn_kind(self.config, i) == FFNKind.ROUTED_MOE:
 				layers.append(MoEBlock(
 					self.config, self.env, self.policy, i, self.moe_checkpoint,
-					self.expert_provider_factory,
+					self.expert_provider_factory, self.expert_trace_path,
 				))
 			else:
 				layers.append(MLP(
@@ -1877,7 +1888,16 @@ def run_flexgen(args):
 				raise ValueError(
 					"--moe_expert_scratch_slots must be in [1, num_experts]"
 				)
-			moe_expert_store = ExpertStore(args.moe_expert_store, config=config)
+			if args.moe_checkpoint_revision == "none":
+				raise ValueError(
+					"demand expert mode requires an immutable "
+					"--moe_checkpoint_revision"
+				)
+			moe_expert_store = ExpertStore(
+				args.moe_expert_store,
+				config=config,
+				expected_source_revision=args.moe_checkpoint_revision,
+			)
 			memory_plan = estimate_qwen3_moe_demand_memory(
 				config=config,
 				scratch_slots=scratch_slots,
@@ -2053,18 +2073,19 @@ def run_flexgen(args):
 			direct=args.moe_expert_reader == 'direct',
 			verify_reads=bool(args.moe_expert_verify_reads),
 		)
-	model = LM(
-		config,
-		env,
-		args.model_path,
-		policy,
-		skew_paths,
-		args.lr_proj_path,
-		moe_checkpoint=moe_checkpoint,
-		expert_provider_factory=expert_provider_factory,
-	)
-
-	try:        
+	model = None
+	try:
+		model = LM(
+			config,
+			env,
+			args.model_path,
+			policy,
+			skew_paths,
+			args.lr_proj_path,
+			moe_checkpoint=moe_checkpoint,
+			expert_provider_factory=expert_provider_factory,
+			expert_trace_path=args.moe_expert_trace,
+		)
 		# print("Warming up...")
 		# output_ids = model.generate(
 		# 	warmup_inputs, max_new_tokens=1)
@@ -2084,25 +2105,27 @@ def run_flexgen(args):
 			torch.cuda.synchronize()
 		costs = timers("generate").costs
 	finally:
-		if expert_provider_factory is not None:
-			workspace = expert_provider_factory.workspace
-			if workspace is not None:
-				print(
-					f"Expert demand I/O: calls={workspace.materialize_calls}, "
-					f"reads={workspace.read_count}, "
-					f"logical_bytes={workspace.logical_bytes}, "
-					f"stored_bytes={workspace.stored_bytes}, "
-					f"read_ms={workspace.read_seconds * 1000:.3f}, "
-					f"copy_ms={workspace.copy_seconds * 1000:.3f}",
-					flush=True,
-				)
-				print(
-					"Expert demand layer stats: "
-					+ json.dumps(workspace.layer_stats, sort_keys=True),
-					flush=True,
-				)
-			expert_provider_factory.close()
-		env.close_copy_threads()
+		try:
+			if expert_provider_factory is not None:
+				workspace = expert_provider_factory.workspace
+				if workspace is not None:
+					print(
+						f"Expert demand I/O: calls={workspace.materialize_calls}, "
+						f"reads={workspace.read_count}, "
+						f"logical_bytes={workspace.logical_bytes}, "
+						f"stored_bytes={workspace.stored_bytes}, "
+						f"read_ms={workspace.read_seconds * 1000:.3f}, "
+						f"copy_ms={workspace.copy_seconds * 1000:.3f}",
+						flush=True,
+					)
+					print(
+						"Expert demand layer aggregates: "
+						+ json.dumps(workspace.layer_stats, sort_keys=True),
+						flush=True,
+					)
+				expert_provider_factory.close()
+		finally:
+			env.close_copy_threads()
 
 	outputs = tokenizer.batch_decode(output_ids[:, args.prompt_len:], skip_special_tokens=True)
 	show_str = ''
@@ -2235,6 +2258,11 @@ def add_parser_arguments(parser):
 		help="Directory containing a validated M2 expert manifest and data files.",
 	)
 	parser.add_argument(
+		"--moe_checkpoint_revision",
+		default="none",
+		help="Immutable checkpoint revision required to match the expert store.",
+	)
+	parser.add_argument(
 		"--moe_expert_reader",
 		choices=("buffered", "direct"),
 		default="direct",
@@ -2261,6 +2289,11 @@ def add_parser_arguments(parser):
 		choices=(0, 1),
 		default=0,
 		help="Verify every demanded extent checksum; intended for fixture/debug runs.",
+	)
+	parser.add_argument(
+		"--moe_expert_trace",
+		default="none",
+		help="Optional JSONL path for per-chunk selected and unique expert IDs.",
 	)
 	
  

@@ -1,7 +1,9 @@
 import json
+import builtins
 import os
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,6 +20,7 @@ from expert_store import (
     qwen3_expert_logical_bytes,
     qwen3_expert_store_required_bytes,
     qwen3_moe_fixed_weight_bytes,
+    qwen3_moe_largest_fixed_tensor_bytes,
 )
 from moe import ResidentExpertProvider, qwen3_moe_forward
 from moe_weights import (
@@ -65,6 +68,13 @@ class ExpertStoreTest(unittest.TestCase):
             checkpoint, self.config, store_dir, source_revision="fixture-revision"
         )
 
+    def load_store(self, store_dir):
+        return ExpertStore(
+            store_dir,
+            config=self.config,
+            expected_source_revision="fixture-revision",
+        )
+
     def test_pack_is_aligned_lossless_and_complete(self):
         with tempfile.TemporaryDirectory() as checkpoint_dir, tempfile.TemporaryDirectory() as root:
             store_dir = Path(root, "store")
@@ -91,6 +101,22 @@ class ExpertStoreTest(unittest.TestCase):
                     SafetensorCheckpoint(checkpoint_dir), self.config, store_dir
                 )
 
+    def test_publication_failure_removes_artifacts_created_by_call(self):
+        with tempfile.TemporaryDirectory() as checkpoint_dir, tempfile.TemporaryDirectory() as root:
+            self.make_checkpoint(checkpoint_dir)
+            store_dir = Path(root, "store")
+            with mock.patch.object(
+                Path, "write_text", side_effect=OSError("injected manifest failure")
+            ):
+                with self.assertRaisesRegex(OSError, "injected manifest failure"):
+                    pack_qwen3_expert_store(
+                        SafetensorCheckpoint(checkpoint_dir),
+                        self.config,
+                        store_dir,
+                        source_revision="fixture-revision",
+                    )
+            self.assertEqual(list(store_dir.iterdir()), [])
+
     def test_validation_rejects_config_corruption_overlap_and_checksum(self):
         with tempfile.TemporaryDirectory() as checkpoint_dir, tempfile.TemporaryDirectory() as root:
             store_dir = Path(root, "store")
@@ -98,14 +124,53 @@ class ExpertStoreTest(unittest.TestCase):
             wrong = SimpleNamespace(**vars(self.config))
             wrong.num_experts_per_tok = 1
             with self.assertRaisesRegex(ValueError, "fingerprint mismatch"):
-                ExpertStore(store_dir, config=wrong)
+                ExpertStore(
+                    store_dir,
+                    config=wrong,
+                    expected_source_revision="fixture-revision",
+                )
+
+            with self.assertRaisesRegex(ValueError, "source revision mismatch"):
+                ExpertStore(
+                    store_dir,
+                    config=self.config,
+                    expected_source_revision="different-revision",
+                )
 
             manifest_path = Path(store_dir, "manifest.json")
             manifest = json.loads(manifest_path.read_text())
             manifest["extents"][1]["offset"] = manifest["extents"][0]["offset"]
             manifest_path.write_text(json.dumps(manifest))
             with self.assertRaisesRegex(ValueError, "overlapping"):
-                ExpertStore(store_dir, config=self.config)
+                self.load_store(store_dir)
+
+    def test_manifest_rejects_float_component_range_and_nonhex_checksum(self):
+        with tempfile.TemporaryDirectory() as checkpoint_dir, tempfile.TemporaryDirectory() as root:
+            store_dir = Path(root, "store")
+            self.pack(checkpoint_dir, store_dir)
+            manifest_path = Path(store_dir, "manifest.json")
+            manifest = json.loads(manifest_path.read_text())
+            manifest["extents"][0]["components"][0]["length"] = float(
+                manifest["extents"][0]["components"][0]["length"]
+            )
+            manifest_path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "range type"):
+                self.load_store(store_dir)
+            manifest["extents"][0]["components"][0]["length"] = int(
+                manifest["extents"][0]["components"][0]["length"]
+            )
+            manifest["extents"][0]["checksum"] = "z" * 64
+            manifest_path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "SHA-256"):
+                self.load_store(store_dir)
+
+    def test_offline_verify_does_not_leak_extent_readers(self):
+        with tempfile.TemporaryDirectory() as checkpoint_dir, tempfile.TemporaryDirectory() as root:
+            store = self.pack(checkpoint_dir, Path(root, "store"))
+            before = len(os.listdir("/proc/self/fd"))
+            self.assertEqual(store.verify_checksums(), 8)
+            after = len(os.listdir("/proc/self/fd"))
+        self.assertEqual(after, before)
 
     def test_reader_detects_short_read_and_closes_idempotently(self):
         with tempfile.NamedTemporaryFile() as handle:
@@ -132,6 +197,54 @@ class ExpertStoreTest(unittest.TestCase):
             after = len(os.listdir("/proc/self/fd"))
         self.assertEqual(after, before)
 
+    def test_direct_reader_import_failure_closes_open_fd(self):
+        real_import = builtins.__import__
+
+        def rejecting_import(name, *args, **kwargs):
+            if name == "liburing":
+                raise ImportError("injected liburing failure")
+            return real_import(name, *args, **kwargs)
+
+        with tempfile.NamedTemporaryFile() as handle:
+            handle.write(b"x" * DEFAULT_ALIGNMENT)
+            handle.flush()
+            before = len(os.listdir("/proc/self/fd"))
+            with mock.patch("builtins.__import__", side_effect=rejecting_import):
+                with self.assertRaisesRegex(ImportError, "injected"):
+                    SynchronousExtentReader(handle.name, direct=True)
+            after = len(os.listdir("/proc/self/fd"))
+        self.assertEqual(after, before)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA host registration")
+    def test_direct_cuda_registered_lifecycle_is_bounded(self):
+        def status_value(name):
+            for line in Path("/proc/self/status").read_text().splitlines():
+                if line.startswith(name + ":"):
+                    return int(line.split()[1])
+            raise AssertionError(f"missing {name}")
+
+        with tempfile.NamedTemporaryFile() as handle:
+            handle.write(b"x" * DEFAULT_ALIGNMENT)
+            handle.flush()
+            # Exclude CUDA runtime's one-time device/context descriptors.
+            with SynchronousExtentReader(
+                handle.name, direct=True, pin_cuda=True
+            ) as reader:
+                view = reader.read(0, 16, DEFAULT_ALIGNMENT)
+                view.release()
+            before_fd = len(os.listdir("/proc/self/fd"))
+            before_locked = status_value("VmLck")
+            for _ in range(10):
+                with SynchronousExtentReader(
+                    handle.name, direct=True, pin_cuda=True
+                ) as reader:
+                    view = reader.read(0, 16, DEFAULT_ALIGNMENT)
+                    view.release()
+            after_fd = len(os.listdir("/proc/self/fd"))
+            after_locked = status_value("VmLck")
+        self.assertEqual(after_fd, before_fd)
+        self.assertEqual(after_locked, before_locked)
+
     def test_demand_provider_matches_resident_and_never_caches(self):
         with tempfile.TemporaryDirectory() as checkpoint_dir, tempfile.TemporaryDirectory() as root:
             store_dir = Path(root, "store")
@@ -142,7 +255,7 @@ class ExpertStoreTest(unittest.TestCase):
                 bank.gate_proj, bank.up_proj, bank.down_proj
             )
             factory = Qwen3DemandExpertProviderFactory(
-                ExpertStore(store_dir, config=self.config), self.config,
+                self.load_store(store_dir), self.config,
                 slots=self.config.num_experts, direct=False,
             )
             demand = factory.create(0, "cpu", torch.bfloat16)
@@ -177,7 +290,7 @@ class ExpertStoreTest(unittest.TestCase):
                 handle.seek(0)
                 handle.write(bytes([original[0] ^ 0xFF]))
             factory = Qwen3DemandExpertProviderFactory(
-                ExpertStore(store_dir, config=self.config), self.config,
+                self.load_store(store_dir), self.config,
                 slots=1, direct=False, verify_reads=True,
             )
             provider = factory.create(0, "cpu", torch.bfloat16)
@@ -190,7 +303,7 @@ class ExpertStoreTest(unittest.TestCase):
             store_dir = Path(root, "store")
             self.pack(checkpoint_dir, store_dir)
             factory = Qwen3DemandExpertProviderFactory(
-                ExpertStore(store_dir, config=self.config), self.config,
+                self.load_store(store_dir), self.config,
                 slots=1, direct=False,
             )
             provider = factory.create(0, "cpu", torch.bfloat16)
@@ -219,7 +332,13 @@ class ExpertStoreTest(unittest.TestCase):
             qwen3_moe_fixed_weight_bytes(self.config)
             + 2 * qwen3_expert_logical_bytes(self.config),
         )
-        self.assertEqual(plan.staging, DEFAULT_ALIGNMENT)
+        self.assertEqual(
+            plan.staging,
+            max(
+                DEFAULT_ALIGNMENT,
+                qwen3_moe_largest_fixed_tensor_bytes(self.config),
+            ),
+        )
         self.assertGreater(plan.system_required, plan.weights)
 
 
