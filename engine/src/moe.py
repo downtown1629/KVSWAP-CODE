@@ -10,6 +10,7 @@ from typing import Protocol
 
 import torch
 import torch.nn.functional as F
+import nvtx
 
 
 @dataclass(frozen=True)
@@ -143,14 +144,15 @@ def qwen3_moe_forward(
         token_indices, topk_positions = torch.where(
             routing.topk_ids == global_id
         )
-        current = flat_hidden.index_select(0, token_indices)
-        gate = F.silu(F.linear(current, experts.gate_proj[slot]))
-        up = F.linear(current, experts.up_proj[slot])
-        expert_output = F.linear(gate * up, experts.down_proj[slot])
-        expert_output = expert_output * routing.topk_weights[
-            token_indices, topk_positions, None
-        ]
-        final_hidden.index_add_(0, token_indices, expert_output)
+        with nvtx.annotate(f"COMPUTE_EXPERT expert={global_id}", color="green"):
+            current = flat_hidden.index_select(0, token_indices)
+            gate = F.silu(F.linear(current, experts.gate_proj[slot]))
+            up = F.linear(current, experts.up_proj[slot])
+            expert_output = F.linear(gate * up, experts.down_proj[slot])
+            expert_output = expert_output * routing.topk_weights[
+                token_indices, topk_positions, None
+            ]
+            final_hidden.index_add_(0, token_indices, expert_output)
 
     return final_hidden.reshape(original_shape), routing
 

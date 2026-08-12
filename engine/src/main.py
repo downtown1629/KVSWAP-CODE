@@ -31,6 +31,13 @@ import torch.nn.functional as F
 from cache_manager import CacheManager
 from model_adapters import FFNKind, get_ffn_kind, is_qwen3_family
 from moe import ResidentExpertProvider, qwen3_moe_layer_forward_chunked
+from expert_store import (
+	ExpertStore,
+	Qwen3DemandExpertProviderFactory,
+	estimate_qwen3_moe_demand_memory,
+	qwen3_expert_logical_bytes,
+	qwen3_moe_fixed_weight_bytes,
+)
 from moe_weights import (
 	SafetensorCheckpoint,
 	SafetensorIndex,
@@ -1008,7 +1015,7 @@ class Qwen3ResidentExpertProviderFactory:
 
 
 class MoEBlock:
-	"""All-resident Qwen3-MoE FFN implementing the existing layer protocol."""
+	"""Qwen3-MoE FFN using a resident or synchronous-demand provider."""
 
 	def __init__(self, config, env, policy, layer_id, checkpoint,
 				 expert_provider_factory):
@@ -1029,8 +1036,8 @@ class MoEBlock:
 	def init_weight(self, weight_home, path):
 		if self.policy.w_gpu_percent != 100 or self.policy.w_cpu_percent != 0:
 			raise ValueError(
-				"M1 MoEBlock requires fully resident weights; use 100/0 GPU/CPU "
-				"weight percentages"
+				"MoEBlock requires fixed weights on GPU; use 100/0 GPU/CPU "
+				"weight percentages (demand experts are managed separately)"
 			)
 		if self.env.gpu is None:
 			raise ValueError("M1 MoEBlock requires a CUDA compute device")
@@ -1090,6 +1097,7 @@ class LM:
 				 skew_paths, 
 				 lr_proj_path,
 				 moe_checkpoint=None,
+				 expert_provider_factory=None,
 				 ):
 		self.config = config
 		self.env = env
@@ -1120,23 +1128,24 @@ class LM:
 			self.rotary_emb = RotaryEmbedding(config=config, device='cuda:0' if self.env.gpu is not None else 'cpu')
 		
 		self.moe_checkpoint = moe_checkpoint
-		self.expert_provider_factory = None
+		self.expert_provider_factory = expert_provider_factory
 		if self.config.model_type == 'qwen3_moe':
 			if self.moe_checkpoint is None:
 				raise ValueError("qwen3_moe requires a preflighted safetensors checkpoint")
-			resident_expert_bytes = sum(
-				qwen3_moe_layer_bytes(self.config, layer_id)
-				for layer_id in range(self.config.num_hidden_layers)
-				if get_ffn_kind(self.config, layer_id) == FFNKind.ROUTED_MOE
-			)
-			print(
-				f"Qwen3-MoE resident router/expert/norm bytes: "
-				f"{resident_expert_bytes / GB:.3f} GB",
-				flush=True,
-			)
-			self.expert_provider_factory = Qwen3ResidentExpertProviderFactory(
-				self.moe_checkpoint, self.config
-			)
+			if self.expert_provider_factory is None:
+				resident_expert_bytes = sum(
+					qwen3_moe_layer_bytes(self.config, layer_id)
+					for layer_id in range(self.config.num_hidden_layers)
+					if get_ffn_kind(self.config, layer_id) == FFNKind.ROUTED_MOE
+				)
+				print(
+					f"Qwen3-MoE resident router/expert/norm bytes: "
+					f"{resident_expert_bytes / GB:.3f} GB",
+					flush=True,
+				)
+				self.expert_provider_factory = Qwen3ResidentExpertProviderFactory(
+					self.moe_checkpoint, self.config
+				)
 
 		layers = []
 		self.attn_layer = []		
@@ -1827,32 +1836,75 @@ def run_flexgen(args):
 	########################################################
 	config = get_model_config(args.model_path)
 	moe_checkpoint = None
+	moe_expert_store = None
 	if config.model_type == 'qwen3_moe':
 		if args.percent[0] != 100 or args.percent[1] != 0:
 			raise ValueError(
-				"M1 Qwen3-MoE requires --percent to keep all weights resident "
-				"on GPU (first two values must be 100 0)"
+				"Qwen3-MoE requires fixed weights on GPU "
+				"(--percent first two values must be 100 0)"
 			)
 		moe_index = SafetensorIndex(args.model_path)
 		validate_qwen3_moe_index(moe_index, config, dtype=torch.bfloat16)
-		resident_weight_bytes = validate_resident_weight_budget(
-			qwen3_moe_resident_bytes(config, dtype=torch.bfloat16),
-			args.moe_resident_weight_limit_gb * GB,
-		)
-		memory_plan = estimate_qwen3_moe_resident_memory(
-			config=config,
-			gpu_batch_size=args.gpu_batch_size,
-			num_gpu_batches=args.num_gpu_batches,
-			prompt_len=args.prompt_len,
-			gen_len=args.gen_len,
-			cache_gpu_percent=args.percent[2],
-			cache_cpu_percent=args.percent[3],
-			activation_gpu_percent=args.percent[4],
-			activation_cpu_percent=args.percent[5],
-			flash_attention=bool(args.flash_att),
-			system_headroom_bytes=args.moe_system_headroom_gb * GB,
-			dtype=torch.bfloat16,
-		)
+		if args.expert_mode == "resident":
+			approved_weight_bytes = validate_resident_weight_budget(
+				qwen3_moe_resident_bytes(config, dtype=torch.bfloat16),
+				args.moe_resident_weight_limit_gb * GB,
+			)
+			memory_plan = estimate_qwen3_moe_resident_memory(
+				config=config,
+				gpu_batch_size=args.gpu_batch_size,
+				num_gpu_batches=args.num_gpu_batches,
+				prompt_len=args.prompt_len,
+				gen_len=args.gen_len,
+				cache_gpu_percent=args.percent[2],
+				cache_cpu_percent=args.percent[3],
+				activation_gpu_percent=args.percent[4],
+				activation_cpu_percent=args.percent[5],
+				flash_attention=bool(args.flash_att),
+				system_headroom_bytes=args.moe_system_headroom_gb * GB,
+				dtype=torch.bfloat16,
+			)
+			approval_limit_gb = args.moe_resident_weight_limit_gb
+		else:
+			if args.moe_expert_store == "none":
+				raise ValueError("demand expert mode requires --moe_expert_store")
+			max_unique = min(
+				config.num_experts,
+				args.moe_token_chunk_size * config.num_experts_per_tok,
+			)
+			scratch_slots = args.moe_expert_scratch_slots or max_unique
+			if not 0 < scratch_slots <= config.num_experts:
+				raise ValueError(
+					"--moe_expert_scratch_slots must be in [1, num_experts]"
+				)
+			moe_expert_store = ExpertStore(args.moe_expert_store, config=config)
+			memory_plan = estimate_qwen3_moe_demand_memory(
+				config=config,
+				scratch_slots=scratch_slots,
+				gpu_batch_size=args.gpu_batch_size,
+				num_gpu_batches=args.num_gpu_batches,
+				prompt_len=args.prompt_len,
+				gen_len=args.gen_len,
+				cache_gpu_percent=args.percent[2],
+				cache_cpu_percent=args.percent[3],
+				activation_gpu_percent=args.percent[4],
+				activation_cpu_percent=args.percent[5],
+				flash_attention=bool(args.flash_att),
+				system_headroom_bytes=args.moe_system_headroom_gb * GB,
+				dtype=torch.bfloat16,
+			)
+			approval_limit_gb = args.moe_demand_weight_limit_gb
+			if approval_limit_gb <= 0:
+				raise ValueError(
+					"demand-mode fixed+scratch allocation is disabled by default; "
+					"set a positive --moe_demand_weight_limit_gb"
+				)
+			if memory_plan.weights > approval_limit_gb * GB:
+				raise MemoryError(
+					f"demand fixed+scratch needs {memory_plan.weights / GB:.3f} GiB, "
+					f"exceeding the {approval_limit_gb:.3f} GiB approval limit"
+				)
+			approved_weight_bytes = memory_plan.weights
 		available_bytes, total_bytes = read_linux_memory_capacity()
 		validate_resident_memory_capacity(
 			memory_plan,
@@ -1861,9 +1913,9 @@ def run_flexgen(args):
 			cuda_allocator_fraction=0.85,
 		)
 		print(
-			f"Qwen3-MoE checkpoint weight approval: "
-			f"{resident_weight_bytes / GB:.3f} GiB within "
-			f"{args.moe_resident_weight_limit_gb:.3f} GiB limit",
+			f"Qwen3-MoE {args.expert_mode} weight approval: "
+			f"{approved_weight_bytes / GB:.3f} GiB within "
+			f"{approval_limit_gb:.3f} GiB limit",
 			flush=True,
 		)
 		print(
@@ -1875,6 +1927,14 @@ def run_flexgen(args):
 			f"headroom={memory_plan.system_headroom / GB:.3f} GiB",
 			flush=True,
 		)
+		if args.expert_mode == "demand":
+			print(
+				f"Qwen3-MoE demand store: extents={len(moe_expert_store.extents)}, "
+				f"scratch_slots={scratch_slots}, "
+				f"expert_bytes={qwen3_expert_logical_bytes(config) / GB:.3f} GiB, "
+				f"reader={args.moe_expert_reader}",
+				flush=True,
+			)
 		# Opening every shard and validating shapes is intentionally delayed
 		# until the metadata-only size/name/budget gate succeeds.
 		moe_checkpoint = SafetensorCheckpoint(args.model_path)
@@ -1884,6 +1944,8 @@ def run_flexgen(args):
 			dtype=torch.bfloat16,
 		)
 		print(f"Validated routed MoE layers: {routed_layers}", flush=True)
+	elif args.expert_mode != "resident":
+		raise ValueError("--expert_mode=demand is supported only for qwen3_moe")
 	########################################################
 	tokenizer = AutoTokenizer.from_pretrained(args.model_path, padding_side="left")
 	if not hasattr(tokenizer, 'pad_token') or tokenizer.pad_token is None:
@@ -1982,6 +2044,15 @@ def run_flexgen(args):
 		print("Setting skew_partial_idx_path to", args.skew_partial_idx_path)
 		
 	skew_paths = (args.skew_partial_idx_path, args.skew_matrix_path)
+	expert_provider_factory = None
+	if config.model_type == 'qwen3_moe' and args.expert_mode == 'demand':
+		expert_provider_factory = Qwen3DemandExpertProviderFactory(
+			moe_expert_store,
+			config,
+			slots=scratch_slots,
+			direct=args.moe_expert_reader == 'direct',
+			verify_reads=bool(args.moe_expert_verify_reads),
+		)
 	model = LM(
 		config,
 		env,
@@ -1990,6 +2061,7 @@ def run_flexgen(args):
 		skew_paths,
 		args.lr_proj_path,
 		moe_checkpoint=moe_checkpoint,
+		expert_provider_factory=expert_provider_factory,
 	)
 
 	try:        
@@ -2012,6 +2084,24 @@ def run_flexgen(args):
 			torch.cuda.synchronize()
 		costs = timers("generate").costs
 	finally:
+		if expert_provider_factory is not None:
+			workspace = expert_provider_factory.workspace
+			if workspace is not None:
+				print(
+					f"Expert demand I/O: calls={workspace.materialize_calls}, "
+					f"reads={workspace.read_count}, "
+					f"logical_bytes={workspace.logical_bytes}, "
+					f"stored_bytes={workspace.stored_bytes}, "
+					f"read_ms={workspace.read_seconds * 1000:.3f}, "
+					f"copy_ms={workspace.copy_seconds * 1000:.3f}",
+					flush=True,
+				)
+				print(
+					"Expert demand layer stats: "
+					+ json.dumps(workspace.layer_stats, sort_keys=True),
+					flush=True,
+				)
+			expert_provider_factory.close()
 		env.close_copy_threads()
 
 	outputs = tokenizer.batch_decode(output_ids[:, args.prompt_len:], skip_special_tokens=True)
@@ -2132,6 +2222,45 @@ def add_parser_arguments(parser):
 		type=int,
 		default=8192,
 		help="Maximum routed-MoE tokens processed at once to bound prefill temporaries.",
+	)
+	parser.add_argument(
+		"--expert_mode",
+		choices=("resident", "demand"),
+		default="resident",
+		help="Routed-expert backend; demand performs synchronous per-call storage reads.",
+	)
+	parser.add_argument(
+		"--moe_expert_store",
+		default="none",
+		help="Directory containing a validated M2 expert manifest and data files.",
+	)
+	parser.add_argument(
+		"--moe_expert_reader",
+		choices=("buffered", "direct"),
+		default="direct",
+		help="Synchronous expert extent reader backend.",
+	)
+	parser.add_argument(
+		"--moe_expert_scratch_slots",
+		type=int,
+		default=0,
+		help=(
+			"Bounded unique-expert scratch slots; 0 uses min(num_experts, "
+			"moe_token_chunk_size * top_k)."
+		),
+	)
+	parser.add_argument(
+		"--moe_demand_weight_limit_gb",
+		type=float,
+		default=0.0,
+		help="Explicit approval limit for demand-mode fixed weights plus expert scratch.",
+	)
+	parser.add_argument(
+		"--moe_expert_verify_reads",
+		type=int,
+		choices=(0, 1),
+		default=0,
+		help="Verify every demanded extent checksum; intended for fixture/debug runs.",
 	)
 	
  

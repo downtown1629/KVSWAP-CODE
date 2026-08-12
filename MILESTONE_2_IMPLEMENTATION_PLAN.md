@@ -224,14 +224,18 @@ bash scripts/eval_moe_m2.sh real-demand          # explicit memory approval requ
 
 M2 완료 조건은 다음과 같다.
 
-- [ ] M1의 resident/KVSwap/dense 선행 gate가 닫혔다.
-- [ ] expert store가 lossless하며 O(1) lookup과 strict validation을 제공한다.
-- [ ] startup에 routed expert 전체가 LPDDR에 materialize되지 않는다.
-- [ ] selected unique expert만 동기적으로 읽고 호출 간 cache/reuse가 없다.
-- [ ] resident와 demand path의 routing, MoE output 및 fixture token이 일치한다.
-- [ ] 반복 generation의 memory/locked-memory/fd 수가 bounded다.
-- [ ] expert 및 KV traffic이 trace와 byte accounting으로 설명된다.
-- [ ] 이전 resident baseline과 모든 M1 test가 유지된다.
+- [x] M1의 resident/KVSwap/dense 선행 gate가 닫혔다.
+- [x] expert store가 lossless하며 O(1) lookup과 strict validation을 제공한다.
+- [x] startup에 routed expert 전체가 LPDDR에 materialize되지 않는다.
+- [x] selected unique expert만 동기적으로 읽고 호출 간 cache/reuse가 없다.
+- [x] resident와 demand path의 routing, MoE output 및 fixture token이 일치한다.
+- [x] 반복 generation의 memory/locked-memory/fd 수가 bounded다.
+- [x] expert 및 KV traffic이 trace와 byte accounting으로 설명된다.
+- [x] 이전 resident baseline과 모든 M1 test가 유지된다.
+
+위 항목은 tiny deterministic fixture에서 확인한 1차 구현 gate다. 실제
+Qwen3-30B-A3B의 manifest/preflight 및 허용 가능한 하드웨어에서의 generation은 Gate F의
+최종 evidence로 별도 기록하며, 이를 완료하기 전에는 전체 M2를 closed로 선언하지 않는다.
 
 M3는 이 storage index와 reader를 재사용해 bounded LRU를 추가한다. M2에는 cache slot
 metadata, eviction policy, async lease, prediction 또는 unified I/O task abstraction을

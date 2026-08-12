@@ -257,6 +257,19 @@ class MoEMainWiringStaticTest(unittest.TestCase):
             self.assertNotIn("prefetch_cache", source)
             self.assertNotIn("submit_copy", source)
 
+    def test_m2_demand_mode_is_explicit_and_keeps_kv_storage_separate(self):
+        source = self.source_path.read_text()
+        expert_source = (
+            Path(__file__).parents[1] / "src" / "expert_store.py"
+        ).read_text()
+        self.assertIn('"--expert_mode"', source)
+        self.assertIn('choices=("resident", "demand")', source)
+        self.assertIn('"--moe_expert_store"', source)
+        self.assertIn("Qwen3DemandExpertProviderFactory", source)
+        self.assertNotIn("CacheManager", expert_source)
+        self.assertNotIn("TorchDisk", expert_source)
+        self.assertNotIn("general_copy", expert_source)
+
 
 if __name__ == "__main__":
     unittest.main()
