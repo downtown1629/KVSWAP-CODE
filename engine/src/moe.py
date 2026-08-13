@@ -161,38 +161,41 @@ def qwen3_moe_forward(
     original_shape = hidden_states.shape
     hidden_size = original_shape[-1]
     flat_hidden = hidden_states.reshape(-1, hidden_size)
-    routing = route_qwen3_moe(
-        hidden_states, router_weight, top_k, norm_topk_prob,
-        router_fp32=router_fp32,
-    )
-    experts = expert_provider.materialize(routing.topk_ids)
+    with nvtx.annotate("KVSWAP_MOE_STAGE name=router", color="yellow"):
+        routing = route_qwen3_moe(
+            hidden_states, router_weight, top_k, norm_topk_prob,
+            router_fp32=router_fp32,
+        )
+    with nvtx.annotate("KVSWAP_MOE_STAGE name=materialize", color="orange"):
+        experts = expert_provider.materialize(routing.topk_ids)
     accumulation_dtype = torch.float32 if router_fp32 else flat_hidden.dtype
     final_hidden = torch.zeros_like(flat_hidden, dtype=accumulation_dtype)
 
-    for global_id_tensor in torch.unique(routing.topk_ids):
-        global_id = int(global_id_tensor.item())
-        slots = torch.where(experts.global_ids == global_id)[0]
-        if slots.numel() != 1:
-            raise RuntimeError(
-                f"provider returned {slots.numel()} slots for expert {global_id}"
+    with nvtx.annotate("KVSWAP_MOE_STAGE name=dispatch_compute", color="green"):
+        for global_id_tensor in torch.unique(routing.topk_ids):
+            global_id = int(global_id_tensor.item())
+            slots = torch.where(experts.global_ids == global_id)[0]
+            if slots.numel() != 1:
+                raise RuntimeError(
+                    f"provider returned {slots.numel()} slots for expert {global_id}"
+                )
+            slot = int(slots[0].item())
+            token_indices, topk_positions = torch.where(
+                routing.topk_ids == global_id
             )
-        slot = int(slots[0].item())
-        token_indices, topk_positions = torch.where(
-            routing.topk_ids == global_id
-        )
-        with nvtx.annotate(f"COMPUTE_EXPERT expert={global_id}", color="green"):
-            current = flat_hidden.index_select(0, token_indices)
-            gate_linear = F.linear(current, experts.gate_proj[slot])
-            up = F.linear(current, experts.up_proj[slot])
-            if expert_clamp:
-                gate_linear = torch.clamp(gate_linear, max=7.0)
-                up = torch.clamp(up, min=-7.0, max=7.0)
-            gate = F.silu(gate_linear)
-            expert_output = F.linear(gate * up, experts.down_proj[slot])
-            expert_output = expert_output.to(accumulation_dtype) * routing.topk_weights[
-                token_indices, topk_positions, None
-            ].to(accumulation_dtype)
-            final_hidden.index_add_(0, token_indices, expert_output)
+            with nvtx.annotate(f"COMPUTE_EXPERT expert={global_id}", color="green"):
+                current = flat_hidden.index_select(0, token_indices)
+                gate_linear = F.linear(current, experts.gate_proj[slot])
+                up = F.linear(current, experts.up_proj[slot])
+                if expert_clamp:
+                    gate_linear = torch.clamp(gate_linear, max=7.0)
+                    up = torch.clamp(up, min=-7.0, max=7.0)
+                gate = F.silu(gate_linear)
+                expert_output = F.linear(gate * up, experts.down_proj[slot])
+                expert_output = expert_output.to(accumulation_dtype) * routing.topk_weights[
+                    token_indices, topk_positions, None
+                ].to(accumulation_dtype)
+                final_hidden.index_add_(0, token_indices, expert_output)
 
     return final_hidden.to(hidden_states.dtype).reshape(original_shape), routing
 
@@ -219,9 +222,10 @@ def qwen3_moe_layer_forward(
 ):
     """Apply Qwen3-MoE post-attention norm, routed FFN, and residual."""
     residual = hidden_states
-    normalized = rms_norm_reference(
-        hidden_states, post_attention_norm, rms_norm_eps
-    )
+    with nvtx.annotate("KVSWAP_MOE_STAGE name=norm", color="yellow"):
+        normalized = rms_norm_reference(
+            hidden_states, post_attention_norm, rms_norm_eps
+        )
     moe_output, routing = qwen3_moe_forward(
         normalized,
         router_weight,
@@ -231,7 +235,9 @@ def qwen3_moe_layer_forward(
         expert_clamp=expert_clamp,
         router_fp32=router_fp32,
     )
-    return residual + moe_output, routing
+    with nvtx.annotate("KVSWAP_MOE_STAGE name=residual", color="green"):
+        output = residual + moe_output
+    return output, routing
 
 
 def qwen3_moe_layer_forward_chunked(
@@ -267,17 +273,22 @@ def qwen3_moe_layer_forward_chunked(
     outputs = []
     routings = []
     for start in range(0, flat_hidden.shape[0], token_chunk_size):
-        output, routing = qwen3_moe_layer_forward(
-            flat_hidden[start : start + token_chunk_size],
-            post_attention_norm,
-            router_weight,
-            expert_provider,
-            top_k,
-            norm_topk_prob,
-            rms_norm_eps,
-            expert_clamp=expert_clamp,
-            router_fp32=router_fp32,
-        )
+        end = min(start + token_chunk_size, flat_hidden.shape[0])
+        with nvtx.annotate(
+            f"KVSWAP_PREFILL_CHUNK start={start} end={end} tokens={end - start}",
+            color="teal",
+        ):
+            output, routing = qwen3_moe_layer_forward(
+                flat_hidden[start:end],
+                post_attention_norm,
+                router_weight,
+                expert_provider,
+                top_k,
+                norm_topk_prob,
+                rms_norm_eps,
+                expert_clamp=expert_clamp,
+                router_fp32=router_fp32,
+            )
         outputs.append(output)
         routings.append(routing)
     routing = RoutingResult(

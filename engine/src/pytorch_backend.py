@@ -317,29 +317,32 @@ class TorchDevice:
 			end = min(start + eff_chunk, s)
 			q_chunk = q[:, start:end]  # [b, chunk, h, head_dim]
 			chunk_len = end - start
-			
-			if flashatt:
-				# A shorter FlashAttention query is aligned to the end of K/V.
-				# Use the matching prefix so chunked prefill keeps absolute
-				# causal and sliding-window positions.
-				prefix_k = k[:, :end]
-				prefix_v = v[:, :end]
-				out[:, start:end] = flash_attn_func(q_chunk, prefix_k, prefix_v,
-									causal=True,
-									window_size=(sliding_window - 1, 0) if sliding_window else (-1, -1),
-									softmax_scale=scaling).reshape(b, chunk_len, d)
-			else:
-				tmp = torch.matmul(
-					q_chunk.transpose(1, 2),        # [b, h, chunk, head_dim]
-					key.permute(0, 2, 3, 1),        # [b, h, head_dim, s]
-				) * scaling
-				tmp.masked_fill_(~attn_mask_full[:, :, start:end], neg_inf)
-				tmp = torch.softmax(tmp.float(), dim=-1).to(tmp.dtype)
-				tmp = torch.matmul(
-					tmp,
-					value.transpose(1, 2),          # [b, h, s, head_dim]
-				)                                   # [b, h, chunk, head_dim]
-				out[:, start:end] = tmp.transpose(1, 2).reshape(b, chunk_len, d)
+			with nvtx.annotate(
+				f"KVSWAP_ATTENTION_CHUNK start={start} end={end} tokens={chunk_len}",
+				color="teal",
+			):
+				if flashatt:
+					# A shorter FlashAttention query is aligned to the end of K/V.
+					# Use the matching prefix so chunked prefill keeps absolute
+					# causal and sliding-window positions.
+					prefix_k = k[:, :end]
+					prefix_v = v[:, :end]
+					out[:, start:end] = flash_attn_func(q_chunk, prefix_k, prefix_v,
+										causal=True,
+										window_size=(sliding_window - 1, 0) if sliding_window else (-1, -1),
+										softmax_scale=scaling).reshape(b, chunk_len, d)
+				else:
+					tmp = torch.matmul(
+						q_chunk.transpose(1, 2),        # [b, h, chunk, head_dim]
+						key.permute(0, 2, 3, 1),        # [b, h, head_dim, s]
+					) * scaling
+					tmp.masked_fill_(~attn_mask_full[:, :, start:end], neg_inf)
+					tmp = torch.softmax(tmp.float(), dim=-1).to(tmp.dtype)
+					tmp = torch.matmul(
+						tmp,
+						value.transpose(1, 2),          # [b, h, s, head_dim]
+					)                                   # [b, h, chunk, head_dim]
+					out[:, start:end] = tmp.transpose(1, 2).reshape(b, chunk_len, d)
 		return out
 
 	@torch.inference_mode()
@@ -353,54 +356,56 @@ class TorchDevice:
 		b, s, d = inputs.shape
 		dtype = inputs.data.dtype
 		
-		if b_ln is not None:
-			hidden = F.layer_norm(inputs.data, (d,), weight=w_ln.data.to(dtype), bias=b_ln.data.to(dtype))
-		else:
-			hidden = rms_norm(inputs.data, w_ln.data.to(dtype), eps=rms_norm_eps)
+		with nvtx.annotate("KVSWAP_ATTENTION_STAGE name=norm", color="yellow"):
+			if b_ln is not None:
+				hidden = F.layer_norm(inputs.data, (d,), weight=w_ln.data.to(dtype), bias=b_ln.data.to(dtype))
+			else:
+				hidden = rms_norm(inputs.data, w_ln.data.to(dtype), eps=rms_norm_eps)
 
 		# shape: (b, s, h)
-		if w_q.data.shape[1] == w_q.data.shape[0] + 1:
-			hidden_ = torch.cat((hidden, torch.ones(b, s, 1, dtype=hidden.dtype, device=hidden.device)), dim=-1)
-			q = F.linear(hidden_, w_q.data.to(dtype), bias=None) 
-			k = F.linear(hidden_, w_k.data.to(dtype), bias=None)
-			del hidden_
-		else: 
-			q = F.linear(hidden, w_q.data.to(dtype), bias=b_q.data.to(dtype) if b_q is not None else None)
-			k = F.linear(hidden, w_k.data.to(dtype), bias=b_k.data.to(dtype) if b_k is not None else None)
-		
-		v = F.linear(hidden, w_v.data.to(dtype), bias=b_v.data.to(dtype) if b_v is not None else None)
-		del hidden
-		
-		# shape: (b, s, n_head, head_dim)
-		q = q.view(b, s, n_head, head_dim) # b, s, h, d
-		if q_norm is not None:
-			q = rms_norm(q, q_norm.data.to(dtype), eps=rms_norm_eps)
-		k = k.view(b, s, -1, head_dim) 
-		if k_norm is not None:
-			k = rms_norm(k, k_norm.data.to(dtype), eps=rms_norm_eps)
-		v = v.view(b, s, -1, head_dim)
+		with nvtx.annotate("KVSWAP_ATTENTION_STAGE name=qkv_projection", color="yellow"):
+			if w_q.data.shape[1] == w_q.data.shape[0] + 1:
+				hidden_ = torch.cat((hidden, torch.ones(b, s, 1, dtype=hidden.dtype, device=hidden.device)), dim=-1)
+				q = F.linear(hidden_, w_q.data.to(dtype), bias=None)
+				k = F.linear(hidden_, w_k.data.to(dtype), bias=None)
+				del hidden_
+			else:
+				q = F.linear(hidden, w_q.data.to(dtype), bias=b_q.data.to(dtype) if b_q is not None else None)
+				k = F.linear(hidden, w_k.data.to(dtype), bias=b_k.data.to(dtype) if b_k is not None else None)
+			v = F.linear(hidden, w_v.data.to(dtype), bias=b_v.data.to(dtype) if b_v is not None else None)
+			del hidden
+			q = q.view(b, s, n_head, head_dim)
+			if q_norm is not None:
+				q = rms_norm(q, q_norm.data.to(dtype), eps=rms_norm_eps)
+			k = k.view(b, s, -1, head_dim)
+			if k_norm is not None:
+				k = rms_norm(k, k_norm.data.to(dtype), eps=rms_norm_eps)
+			v = v.view(b, s, -1, head_dim)
 
-		if pos_emb is not None:
-			q, k = apply_rotary_pos_emb(q, k, *pos_emb, layout='bshd')
+		with nvtx.annotate("KVSWAP_ATTENTION_STAGE name=rope", color="yellow"):
+			if pos_emb is not None:
+				q, k = apply_rotary_pos_emb(q, k, *pos_emb, layout='bshd')
 
-		out = TorchDevice.chuck_attn(q, k, v, scaling, flashatt, lr_proj_mode, 
-				   b, s, head_dim*n_head, attention_mask, self.dev, n_head, head_dim,
-				   kv_rep, chunk_size, sliding_window=sliding_window)
+		with nvtx.annotate("KVSWAP_ATTENTION_STAGE name=attention", color="blue"):
+			out = TorchDevice.chuck_attn(q, k, v, scaling, flashatt, lr_proj_mode,
+					b, s, head_dim*n_head, attention_mask, self.dev, n_head, head_dim,
+					kv_rep, chunk_size, sliding_window=sliding_window)
 		del q
-			   
-		out = F.linear(out, w_out.data.to(dtype), bias=b_out.data.to(dtype) if b_out is not None else None)
-		out.add_(inputs.data)
+
+		with nvtx.annotate("KVSWAP_ATTENTION_STAGE name=output_projection", color="blue"):
+			out = F.linear(out, w_out.data.to(dtype), bias=b_out.data.to(dtype) if b_out is not None else None)
+			out.add_(inputs.data)
 
 		if donate[0]: inputs.delete()
 		if donate[1]: attention_mask.delete()
 
-		# b, s, h, d -> b, s, h*d
-		k = k.reshape(b, s, -1)
-		v = v.reshape(b, s, -1)
-
-		if compress_cache:
-			k = self.compressed_device.compress(k, comp_config)
-			v = self.compressed_device.compress(v, comp_config)
+		with nvtx.annotate("KVSWAP_ATTENTION_STAGE name=cache_pack", color="orange"):
+			# b, s, h, d -> b, s, h*d
+			k = k.reshape(b, s, -1)
+			v = v.reshape(b, s, -1)
+			if compress_cache:
+				k = self.compressed_device.compress(k, comp_config)
+				v = self.compressed_device.compress(v, comp_config)
 			
 		return TorchTensor.create_from_torch(out, self), k, v
 
@@ -467,7 +472,7 @@ class TorchDevice:
 			if spec_stream is not None:
 				event.record()
 				 
-			with nvtx.annotate("speculate_attention", color='green'):
+			with nvtx.annotate("KVSWAP_ATTENTION_STAGE name=speculate", color='green'):
 				if spec_stream is not None:
 					with torch.cuda.stream(spec_stream):
 						spec_stream.wait_event(event)
@@ -491,7 +496,7 @@ class TorchDevice:
 				t = threading.Thread(target=func)
 				t.start()
 			
-		with nvtx.annotate("att_proj", color='yellow'):   
+		with nvtx.annotate("KVSWAP_ATTENTION_STAGE name=qkv_projection", color='yellow'):
 			# shape: (b, 1, h)
 			if w_q.data.shape[1] == w_q.data.shape[0] + 1:
 				q = F.linear(hidden_, w_q.data.to(dtype), bias=None)
@@ -515,11 +520,11 @@ class TorchDevice:
 				window_kv_buf[0, kv_window_index] = k_new.view(b, -1)
 				window_kv_buf[1, kv_window_index] = v_new.view(b, -1)
 
-		with nvtx.annotate("prefetch_sync1", color='green'): 
+		with nvtx.annotate("KVSWAP_ATTENTION_STAGE name=prefetch_sync", color='green'):
 			if lr_proj_mode != 'none' and prefetch_sync is not None and not newest_fetch_flag.is_set(): # avoid sync the newest prefetch
 				prefetch_sync()
 	
-		with nvtx.annotate("kv_concat", color='red'): 
+		with nvtx.annotate("KVSWAP_ATTENTION_STAGE name=kv_concat", color='red'):
 			if compress_cache:
 				# shape: (s, b * n_head, head_dim)
 				raise NotImplementedError
@@ -586,7 +591,7 @@ class TorchDevice:
 					v = torch.cat((v, v_new), dim=1) # b, s, h, d
 					src_s = k.shape[1]
 		
-		with nvtx.annotate("qktvo", color='blue'):  
+		with nvtx.annotate("KVSWAP_ATTENTION_STAGE name=attention_output", color='blue'):
 			if kv_layout == 'cache_manager':
 				out = TorchDevice.qkvo(q.view(b*tgt_s, n_head, head_dim), None, None, scaling, w_out, b_out, 
 						   				(b, tgt_s, n_head*head_dim), dtype, cache_manager=kv_cache)
@@ -598,7 +603,7 @@ class TorchDevice:
 			if donate[0]: inputs.delete()
 			if donate[1]: attention_mask.delete()
 			
-		with nvtx.annotate("kv_new", color='yellow'):
+		with nvtx.annotate("KVSWAP_ATTENTION_STAGE name=cache_pack", color='yellow'):
 			if compress_cache:
 				raise NotImplementedError
 				if comp_config.group_dim == 0:
@@ -608,7 +613,7 @@ class TorchDevice:
 				k_new = self.compressed_device.compress(k_new, comp_config)
 				v_new = self.compressed_device.compress(v_new, comp_config)
 					
-		with nvtx.annotate("waiting", color='brown'):     
+		with nvtx.annotate("KVSWAP_ATTENTION_STAGE name=prefetch_wait", color='brown'):
 			if enable_pred and lr_proj_mode != 'none':
 				if prefetch_event is not None:
 					t.join()

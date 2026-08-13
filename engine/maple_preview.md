@@ -75,6 +75,33 @@ Nano image, CUDA/NVTX software tracing is allowed but Nsight Compute and Nsight
 Systems hardware GPU metrics are prohibited because they triggered Tegra HWPM
 driver errors and loss of local console output.
 
+For a token/layer Gantt trace, use the non-root software-only wrapper:
+
+```bash
+cd engine
+bash scripts/profile_maple_nsys.sh 32 4
+```
+
+The resulting `.nsys-rep` nests `KVSWAP_TOKEN` → `KVSWAP_LAYER` →
+`KVSWAP_STAGE`, then attention/MoE sub-stages and prefill chunks. Open it with
+Nsight Systems on another machine and expand the process's NVTX row. The wrapper
+also exports a token overview (`.token-gantt.svg`), detailed Gantt SVGs split
+into eight-model-layer pages (`.layers-00-07.gantt.svg`, etc.), raw ranges
+(`.nvtx.csv`), per-token stage totals (`.stage-summary.csv`), and CUDA/NVTX
+summaries (`.stats.txt`). Every SVG includes a legend for the colors present in
+that page. SVG timing is CPU-side NVTX wall time; use the `.nsys-rep` to
+correlate asynchronous CUDA kernels. To change page size without recollecting a
+trace, rerun the exporter on the existing SQLite database:
+
+```bash
+.venv/bin/python scripts/export_nsys_gantt.py TRACE.sqlite --layers-per-page 4
+```
+
+Prefill is one parallel prompt range, so a per-token prefill figure is the total
+divided by prompt length, not an individually timed token. Each subsequent
+`KVSWAP_TOKEN phase=decode` range is one measured output-token step. Stage and
+sub-stage rows are nested and must not be added together.
+
 ## Orin Nano evidence
 
 The pinned BF16 checkpoint was packed into 6,144 extents totaling exactly 36

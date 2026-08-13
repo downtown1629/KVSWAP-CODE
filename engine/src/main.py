@@ -1786,70 +1786,112 @@ class LM:
 		else:
 			return pre+"MLP"
 
+	def profile_token_name(self, i):
+		if i == 0:
+			return (
+				f"KVSWAP_TOKEN phase=prefill step=0 "
+				f"tokens={self.task.prompt_len} output_position={self.task.prompt_len}"
+			)
+		return (
+			f"KVSWAP_TOKEN phase=decode step={i} tokens=1 "
+			f"output_position={self.task.prompt_len + i}"
+		)
+
+	def profile_layer_name(self, i, j):
+		phase = "prefill" if i == 0 else "decode"
+		layer = self.layers[j]
+		model_layer = getattr(layer, "layer_id", -1)
+		kind = self.layer_type(i, j).removeprefix("Pre").lower()
+		if isinstance(layer, SelfAttention):
+			kind = "attention_swa" if layer.sliding_window is not None else "attention_global"
+		return (
+			f"KVSWAP_LAYER phase={phase} step={i} engine_layer={j} "
+			f"model_layer={model_layer} kind={kind}"
+		)
+
 	@torch.inference_mode()
 	def generation_loop_normal_new(self):
 		for i in tqdm(range(self.task.gen_len)):
 			if i == 1:
 				self.warmup()
-			timers("generate").start()
-			for k in range(self.num_gpu_batches):
-				self.update_attention_mask(i, k)
-			for j in range(self.num_layers):
-				with nvtx.annotate(f"layer_{j}", color="blue"):
+			with nvtx.annotate(self.profile_token_name(i), color="purple"):
+				timers("generate").start()
+				with nvtx.annotate("KVSWAP_STAGE name=attention_mask", color="gray"):
 					for k in range(self.num_gpu_batches):
-						self.load_weight(i, j, k)
-					for k in range(self.num_gpu_batches):
-						self.load_cache(i, j, k)
-						self.load_hidden(i, j, k)
-						self.rope(i, j, k)
-						if i > 0 and j in self.attn_layer:                       
-							if self.policy.use_token_cache and j == 1:
-								pass
-							elif self.policy.lr_proj_mode != 'none' and j == 3 and self.start_prefetch_layer <= 0 and self.use_cur_hidden_forl0:
-								pass	
-							elif j in self.attn_layer[:self.start_prefetch_layer+1] or not self.policy.en_ahead_prefetch:
-								self.sync('load_kv', 'prefetch')
-							elif not self.policy.en_finer_prefetch_sync:
-								self.sync('load_kv', 'prefetch')
-							elif self.policy.en_finer_prefetch_sync and j == self.attn_layer[-1]:
-								self.sync('load_kv', 'prefetch')                                                            
-						with nvtx.annotate(f"Comp{self.layer_type(i, j)}", color="red"):
-							if self.policy.en_ahead_prefetch and (j in self.attn_layer[self.start_prefetch_layer2:-1] and i > 0):
-								self.compute_layer(i, j, k, True, self.policy.en_finer_prefetch_sync)
-							else:    
-								self.compute_layer(i, j, k)
-						self.store_hidden(i, j, k)
-						self.store_cache(i, j, k)
-						if self.policy.en_ahead_prefetch == False and j in self.attn_layer[self.start_prefetch_layer2:-1] and i > 0:
-							self.prefetch_cache(i, j, k, self.speculation_stream)
-							
-			timers("generate").stop()
+						self.update_attention_mask(i, k)
+				for j in range(self.num_layers):
+					with nvtx.annotate(self.profile_layer_name(i, j), color="blue"):
+						with nvtx.annotate("KVSWAP_STAGE name=load_weight", color="orange"):
+							for k in range(self.num_gpu_batches):
+								self.load_weight(i, j, k)
+						for k in range(self.num_gpu_batches):
+							with nvtx.annotate("KVSWAP_STAGE name=load_cache", color="orange"):
+								self.load_cache(i, j, k)
+							with nvtx.annotate("KVSWAP_STAGE name=load_hidden", color="gray"):
+								self.load_hidden(i, j, k)
+							with nvtx.annotate("KVSWAP_STAGE name=rope", color="yellow"):
+								self.rope(i, j, k)
+							if i > 0 and j in self.attn_layer:
+								with nvtx.annotate("KVSWAP_STAGE name=sync_kv", color="brown"):
+									if self.policy.use_token_cache and j == 1:
+										pass
+									elif self.policy.lr_proj_mode != 'none' and j == 3 and self.start_prefetch_layer <= 0 and self.use_cur_hidden_forl0:
+										pass
+									elif j in self.attn_layer[:self.start_prefetch_layer+1] or not self.policy.en_ahead_prefetch:
+										self.sync('load_kv', 'prefetch')
+									elif not self.policy.en_finer_prefetch_sync:
+										self.sync('load_kv', 'prefetch')
+									elif self.policy.en_finer_prefetch_sync and j == self.attn_layer[-1]:
+										self.sync('load_kv', 'prefetch')
+							with nvtx.annotate("KVSWAP_STAGE name=compute", color="red"):
+								if self.policy.en_ahead_prefetch and (j in self.attn_layer[self.start_prefetch_layer2:-1] and i > 0):
+									self.compute_layer(i, j, k, True, self.policy.en_finer_prefetch_sync)
+								else:
+									self.compute_layer(i, j, k)
+							with nvtx.annotate("KVSWAP_STAGE name=store_hidden", color="gray"):
+								self.store_hidden(i, j, k)
+							with nvtx.annotate("KVSWAP_STAGE name=store_cache", color="orange"):
+								self.store_cache(i, j, k)
+							if not self.policy.en_ahead_prefetch and j in self.attn_layer[self.start_prefetch_layer2:-1] and i > 0:
+								with nvtx.annotate("KVSWAP_STAGE name=prefetch_cache", color="orange"):
+									self.prefetch_cache(i, j, k, self.speculation_stream)
+				timers("generate").stop()
 
 	@torch.inference_mode()
 	def generation_loop_normal(self):
 		for i in tqdm(range(self.task.gen_len)):
 			if i == 1:
 				self.warmup()
-			timers("generate").start()
-			for k in range(self.num_gpu_batches):
-				self.update_attention_mask(i, k)
-			for j in range(self.num_layers):
-				with nvtx.annotate(f"layer_{j}", color="blue"):
+			with nvtx.annotate(self.profile_token_name(i), color="purple"):
+				timers("generate").start()
+				with nvtx.annotate("KVSWAP_STAGE name=attention_mask", color="gray"):
 					for k in range(self.num_gpu_batches):
-						self.load_weight(i, j, k)
-					for k in range(self.num_gpu_batches):
-						self.load_cache(i, j, k)
-						self.load_hidden(i, j, k)
-						self.rope(i, j, k) 
-						if j in self.attn_layer and i > 0: 
-							self.sync()
-						with nvtx.annotate(f"Comp{self.layer_type(i, j)}", color="red"):
-							self.compute_layer(i, j, k)         
-						self.store_hidden(i, j, k)
-						self.store_cache(i, j, k)
-						if j in self.attn_layer[self.start_prefetch_layer2:-1] and i > 0:
-							self.prefetch_cache(i, j, k, self.speculation_stream)
-			timers("generate").stop()
+						self.update_attention_mask(i, k)
+				for j in range(self.num_layers):
+					with nvtx.annotate(self.profile_layer_name(i, j), color="blue"):
+						with nvtx.annotate("KVSWAP_STAGE name=load_weight", color="orange"):
+							for k in range(self.num_gpu_batches):
+								self.load_weight(i, j, k)
+						for k in range(self.num_gpu_batches):
+							with nvtx.annotate("KVSWAP_STAGE name=load_cache", color="orange"):
+								self.load_cache(i, j, k)
+							with nvtx.annotate("KVSWAP_STAGE name=load_hidden", color="gray"):
+								self.load_hidden(i, j, k)
+							with nvtx.annotate("KVSWAP_STAGE name=rope", color="yellow"):
+								self.rope(i, j, k)
+							if j in self.attn_layer and i > 0:
+								with nvtx.annotate("KVSWAP_STAGE name=sync_kv", color="brown"):
+									self.sync()
+							with nvtx.annotate("KVSWAP_STAGE name=compute", color="red"):
+								self.compute_layer(i, j, k)
+							with nvtx.annotate("KVSWAP_STAGE name=store_hidden", color="gray"):
+								self.store_hidden(i, j, k)
+							with nvtx.annotate("KVSWAP_STAGE name=store_cache", color="orange"):
+								self.store_cache(i, j, k)
+							if j in self.attn_layer[self.start_prefetch_layer2:-1] and i > 0:
+								with nvtx.annotate("KVSWAP_STAGE name=prefetch_cache", color="orange"):
+									self.prefetch_cache(i, j, k, self.speculation_stream)
+				timers("generate").stop()
 
 	def __del__(self):
 		self.delete_all_weights()
