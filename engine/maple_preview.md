@@ -50,6 +50,25 @@ full-checkpoint and extent audit; normal startup only hashes resident tensors
 and validates the manifest checksum root. Keep the revision pinned when copying
 either checkpoint or store.
 
+## Jetson profiling
+
+Use the same `jtop_logger.py` sampler as the original KVSwap Nano reproduction:
+
+```bash
+cd engine
+bash scripts/profile_maple_preview.sh 520 16 1
+```
+
+Arguments are `prompt_len`, `gen_len`, and `batch_size`. Results default to
+`data/kvswap_logs/maple-preview/`; override this with `MAPLE_PROFILE_DIR`.
+Each run keeps the raw engine log, 1 Hz jtop and NVMe samples, a JSON/CSV
+summary, and a timeline PNG. The summary separates prefill and decode latency,
+throughput, GPU/CPU/EMC usage, power/energy, RAM/swap, and NVMe utilization. It
+also reports expert read/copy time, bytes, effective bandwidth, request counts,
+KV disk synchronization, and peak process/CUDA memory. Phase resource values
+are 1 Hz approximations: decode is the final `ceil(decode_latency)` samples and
+prefill is the immediately preceding `ceil(prefill_latency)` samples.
+
 ## Orin Nano evidence
 
 The pinned BF16 checkpoint was packed into 6,144 extents totaling exactly 36

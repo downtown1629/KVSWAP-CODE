@@ -34,7 +34,7 @@ import torch.nn.functional as F
 from cache_manager import CacheManager
 from model_adapters import (
 	FFNKind, get_ffn_kind, has_qk_norm, is_qwen3_family,
-	is_routed_moe_model, sliding_window_for_layer,
+	is_routed_moe_model, kv_cache_capacity, sliding_window_for_layer,
 	uses_persistent_kv, uses_rotary_position, validate_maple_run,
 )
 from moe import (
@@ -570,7 +570,10 @@ class SelfAttention:
 		if self.sliding_window is not None:
 			if self.policy.compress_cache:
 				raise ValueError("Maple sliding KV does not support compressed cache")
-			capacity = self.sliding_window - 1
+			capacity = kv_cache_capacity(
+				self.config, self.layer_id,
+				self.task.prompt_len + self.task.gen_len - 1,
+			)
 			shape = (
 				self.policy.gpu_batch_size,
 				capacity,
