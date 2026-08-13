@@ -74,7 +74,12 @@ class NsightInstrumentationTest(unittest.TestCase):
             )
             for index, name in enumerate(names, 1):
                 connection.execute("INSERT INTO StringIds VALUES (?, ?)", (index, name))
-            for start, end, text_id in ((0, 100, 1), (10, 90, 2), (20, 80, 3), (30, 70, 4)):
+            for start, end, text_id in (
+                (0, 100_000_000, 1),
+                (10_000_000, 90_000_000, 2),
+                (20_000_000, 80_000_000, 3),
+                (30_000_000, 70_000_000, 4),
+            ):
                 connection.execute(
                     "INSERT INTO NVTX_EVENTS VALUES (?, ?, NULL, ?, 7)",
                     (start, end, text_id),
@@ -92,7 +97,10 @@ class NsightInstrumentationTest(unittest.TestCase):
             self.assertIn("L0 attention_swa", detail)
             self.assertIn("qkv_projection", detail)
             self.assertIn(">compute</text>", detail)
-            self.assertIn(">attention_swa</text>", prefix.with_suffix(".token-gantt.svg").read_text())
+            self.assertIn(">80.0 ms</text>", detail)
+            overview = prefix.with_suffix(".token-gantt.svg").read_text()
+            self.assertIn(">attention_swa</text>", overview)
+            self.assertIn(">100.0 ms</text>", overview)
             ET.parse(Path(directory) / "result.step-001-decode.layers-00-00.gantt.svg")
 
 

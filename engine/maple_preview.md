@@ -93,6 +93,11 @@ that page. SVG timing is CPU-side NVTX wall time; use the `.nsys-rep` to
 correlate asynchronous CUDA kernels. To change page size without recollecting a
 trace, rerun the exporter on the existing SQLite database:
 
+Each detailed page crops its X-axis to the selected layer group so the bars use
+the full image width. Sub-pixel events are drawn at a minimum width of 2 px for
+visibility; their tooltip and CSV duration remain exact. Use the token overview
+when absolute placement across all layers is important.
+
 ```bash
 .venv/bin/python scripts/export_nsys_gantt.py TRACE.sqlite --layers-per-page 4
 ```

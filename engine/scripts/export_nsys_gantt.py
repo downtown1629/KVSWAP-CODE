@@ -161,7 +161,9 @@ def write_svg(path, title, rows, origin, finish):
         for item in bars:
             name = short_name(item["name"])
             xpos = x(item["start"])
-            bar_width = max(x(item["end"]) - xpos, .75)
+            # Keep sub-pixel events discoverable without changing their reported
+            # duration. The tooltip and CSV always retain the exact value.
+            bar_width = max(x(item["end"]) - xpos, 2.0)
             duration_ms = (item["end"] - item["start"]) / 1e6
             color = COLORS.get(name, "#b0bec5")
             tip = f"{item['name']} | {duration_ms:.3f} ms"
@@ -259,10 +261,12 @@ def write_outputs(database, output_prefix, layers_per_page=8):
                 f"{output_prefix.name}.step-{int(fields['step']):03d}-{fields['phase']}"
                 f".layers-{suffix}.gantt.svg"
             )
+            page_origin = selected_layers[0]["start"] if selected_layers else token["start"]
+            page_finish = selected_layers[-1]["end"] if selected_layers else token["end"]
             write_svg(
                 path,
-                f"KVSwap {fields['phase']} step {fields['step']} | model layers {suffix}",
-                rows, token["start"], token["end"],
+                f"KVSwap {fields['phase']} step {fields['step']} | model layers {suffix} | cropped time axis",
+                rows, page_origin, page_finish,
             )
             detail_paths.append(path)
     return [raw_csv, summary_csv, output_prefix.with_suffix(".token-gantt.svg"), *detail_paths]
