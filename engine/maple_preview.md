@@ -69,6 +69,12 @@ KV disk synchronization, and peak process/CUDA memory. Phase resource values
 are 1 Hz approximations: decode is the final `ceil(decode_latency)` samples and
 prefill is the immediately preceding `ceil(prefill_latency)` samples.
 
+For Nsight profiling, follow
+[NSIGHT_JETSON_INCIDENT.md](NSIGHT_JETSON_INCIDENT.md). On the current Orin
+Nano image, CUDA/NVTX software tracing is allowed but Nsight Compute and Nsight
+Systems hardware GPU metrics are prohibited because they triggered Tegra HWPM
+driver errors and loss of local console output.
+
 ## Orin Nano evidence
 
 The pinned BF16 checkpoint was packed into 6,144 extents totaling exactly 36
