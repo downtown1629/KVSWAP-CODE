@@ -1,0 +1,32 @@
+# Local configuration and Python environments
+.env
+.env.*
+!.env.example
+**/.env_nano
+.venv/
+.venv*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Downloaded checkpoints, persistent stores, caches, and measurements
+/data/model_weights/
+/data/model_weights_hf/
+/data/nvme_offload/
+/data/kvswap_logs/
+**/.cache/
+**/huggingface/hub/
+*.safetensors
+*.nsys-rep
+*.qdstrm
+
+# Local downloads and external reference snapshots
+/*.tar.xz
+/references/
+
+# Runtime output
+*.log
+*.pid
+core
+core.*
