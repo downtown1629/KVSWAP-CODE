@@ -21,6 +21,9 @@ torch.backends.cuda.matmul.allow_tf32 = True
 from transformers import AutoTokenizer
 from compression import CompressionConfig
 from model_config import get_model_config, cache_bytes, hidden_bytes
+from maple_cache import (
+	append_sliding_decode_, sliding_cache_view, store_sliding_prefill_,
+)
 from pytorch_backend import (TorchDevice, TorchDisk, DeviceType, general_copy, fix_recursive_import, TorchTensor)
 from timer import timers
 from utils import (Task, ExecutionEnv, GB, T, ValueHolder,
@@ -31,7 +34,8 @@ import torch.nn.functional as F
 from cache_manager import CacheManager
 from model_adapters import (
 	FFNKind, get_ffn_kind, has_qk_norm, is_qwen3_family,
-	is_routed_moe_model, uses_rotary_position, validate_maple_run,
+	is_routed_moe_model, sliding_window_for_layer,
+	uses_persistent_kv, uses_rotary_position, validate_maple_run,
 )
 from moe import (
 	ResidentExpertProvider,
@@ -376,6 +380,7 @@ class SelfAttention:
 		self.qnorm = None
 		self.lr_proj_mode = self.policy.lr_proj_mode
 		self.enable_pred = enable_pred
+		self.sliding_window = sliding_window_for_layer(config, layer_id)
 		self.kv_window_index = None
 		self.window_kv_buf = None
 		# if en_pred_emb, we need the first layer's proj weight
@@ -562,6 +567,20 @@ class SelfAttention:
 			weight_read_buf.store(w_store)
 
 	def init_cache_one_gpu_batch(self, cache_home):
+		if self.sliding_window is not None:
+			if self.policy.compress_cache:
+				raise ValueError("Maple sliding KV does not support compressed cache")
+			capacity = self.sliding_window - 1
+			shape = (
+				self.policy.gpu_batch_size,
+				capacity,
+				self.config.num_kv_heads * self.config.head_dim * 2,
+			)
+			cache_home.store(self.compute.allocate(
+				shape, np.float16, pin_memory=None,
+				force_bf16=self.config.dtype == np.float16,
+			))
+			return
 		if self.policy.cache_gpu_percent == 100:
 			device = self.env.gpu
 		elif self.policy.cache_cpu_percent == 100:
@@ -638,6 +657,17 @@ class SelfAttention:
 			
 	def load_cache(self, cache_home, cache_read_buf, i): # load whole cache
 		if i == 0:  # prefill, no cache
+			return
+		if self.sliding_window is not None:
+			kv_home = cache_home.val
+			past_tokens = min(
+				self.task.prompt_len + i - 1, self.sliding_window - 1
+			)
+			recent = sliding_cache_view(kv_home.data, past_tokens)
+			indices = (slice(0, kv_home.shape[0]), slice(0, recent.shape[1]))
+			cache_read_buf.store(
+				(kv_home.smart_copy(self.compute, indices, copy_key='load_kv'), 'bs2hd')
+			)
 			return
 
 		# should only work when self.prefetch_kv is None
@@ -716,6 +746,21 @@ class SelfAttention:
 			return
 		
 		if i == self.task.gen_len - 1:  # last token, no need to store cache
+			return
+
+		if self.sliding_window is not None:
+			kv_home = cache_home.val
+			k_new, v_new = cache_write_buf.pop()
+			sync_func()
+			if i == 0:
+				store_sliding_prefill_(kv_home.data, k_new, v_new)
+			else:
+				append_sliding_decode_(
+					kv_home.data,
+					k_new.reshape(k_new.shape[0], 1, -1),
+					v_new.reshape(v_new.shape[0], 1, -1),
+					self.task.prompt_len + i - 1,
+				)
 			return
 
 		# if self.env.gpu is None:
@@ -825,7 +870,8 @@ class SelfAttention:
 	@torch.inference_mode()
 	def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask, pos_emb, past_pos_emb,
 				cache_write_buf, i, k, spec_stream, prefetch_event, prefetch_sync,
-				next_partial_index, next_partial_wq, next_skew_matrix, next_lr_kproj, next_qproj, next_qnorm, next_lr_k):
+				next_partial_index, next_partial_wq, next_skew_matrix, next_lr_kproj,
+				next_qproj, next_qnorm, next_lr_k, next_pos_emb):
 
 		donate = [False] * 15
 		h, donate[0] = hidden.val, True
@@ -857,7 +903,8 @@ class SelfAttention:
 															self.lr_proj_mode,
 															donate, self.policy.compress_cache, self.policy.comp_cache_config, 
 																	self.policy.flash_att, self.chunk_size,
-																	rms_norm_eps=getattr(self.config, 'rms_norm_eps', 1e-5))
+																	rms_norm_eps=getattr(self.config, 'rms_norm_eps', 1e-5),
+																	sliding_window=self.sliding_window)
 						
 			if not (self.policy.use_token_cache and self.layer_id == 0):
 				cache_write_buf.store((new_k_cache, new_v_cache))
@@ -883,7 +930,8 @@ class SelfAttention:
 				kv_cache.layer_id = self.layer_id
 			h, new_k_cache, new_v_cache = self.compute.mha_gen(h, mask, *w_tuple, 
 																self.config.num_attention_heads, self.config.head_dim, self.config.scaling, 
-																	self.config.num_kv_groups, layer_pos_emb, layer_past_pos_emb,
+																		self.config.num_kv_groups, layer_pos_emb, layer_past_pos_emb,
+																		next_pos_emb,
 																self.enable_pred, self.lr_proj_mode, next_lr_kproj, next_qproj, next_qnorm,
 																next_partial_index, next_partial_wq, next_skew_matrix,
 																kv_cache, next_lr_k_input, self.window_kv_buf, self.kv_window_index,
@@ -1284,7 +1332,9 @@ class LM:
 		if self.policy.use_token_cache and j == 1:
 			return
 				
-		if self.policy.lr_proj_mode == 'none':
+		if isinstance(self.layers[j], SelfAttention) and self.layers[j].sliding_window is not None:
+			self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
+		elif self.policy.lr_proj_mode == 'none':
 			self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
 		elif j not in self.attn_layer[self.start_prefetch_layer+1:]:
 			self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
@@ -1305,6 +1355,8 @@ class LM:
 		if j == 1 and self.start_prefetch_layer <= 0 and self.use_cur_hidden_forl0:
 			return
 		next_attn = self.attn_layer[self.attn_layer.index(j) + 1]
+		if not uses_persistent_kv(self.config, self.layers[next_attn].layer_id):
+			return
 		prefetch_idx = self.layers[j].prefetch_idx
 		self.layers[j].prefetch_idx = None
 		with nvtx.annotate(f"selkvl{next_attn}", color="brown"):
@@ -1405,6 +1457,8 @@ class LM:
 		# fetch kv for att1/emb here.
 		if i == 0:
 			return
+		if not uses_persistent_kv(self.config, self.layers[j].layer_id):
+			return
 
 		b, tgt_s, h = input.shape
 		dtype = input.dtype
@@ -1425,8 +1479,12 @@ class LM:
 		len_lr_k = self.task.prompt_len + i - 1 
 		len_lr_k = len_lr_k - len_lr_k % self.policy.token_group
 
-		prefetch_idx = speculate_attention(self.policy.lr_proj_mode, hidden, next_partial_wq, next_skew_matrix, 
-											next_qproj, next_qnorm, next_lr_kproj, next_lr_kcache[:len_lr_k], self.pos_emb,
+		target_pos_emb = (
+			self.pos_emb if uses_rotary_position(self.config, self.layers[j].layer_id)
+			else None
+		)
+		prefetch_idx = speculate_attention(self.policy.lr_proj_mode, hidden, next_partial_wq, next_skew_matrix,
+											next_qproj, next_qnorm, next_lr_kproj, next_lr_kcache[:len_lr_k], target_pos_emb,
 											next_partial_index, self.config.scaling,
 											self.config.num_attention_heads, self.config.num_kv_groups, 
 											self.policy.alpha, self.policy.max_num_kv, self.policy.token_group,
@@ -1448,7 +1506,13 @@ class LM:
 							self.layers[j].partial_wq, self.layers[j].skew_matrix, self.layers[j].partial_index, 
 							self.weight_read_buf[j], j, i, k)
 			next_att_idx = j + 2
-			if self.policy.lr_proj_mode != 'none' and next_att_idx in self.attn_layer:
+			if (
+				self.policy.lr_proj_mode != 'none'
+				and next_att_idx in self.attn_layer
+				and uses_persistent_kv(
+					self.config, self.layers[next_att_idx].layer_id
+				)
+			):
 				next_partial_index = self.layers[next_att_idx].partial_index
 				next_partial_wq = self.layers[next_att_idx].partial_wq
 				next_skew_matrix = self.layers[next_att_idx].skew_matrix
@@ -1456,14 +1520,20 @@ class LM:
 				next_lr_kproj = self.layers[next_att_idx].lr_kproj
 				next_lr_k = self.layers[next_att_idx].lr_k
 				next_qnorm = self.layers[next_att_idx].qnorm
+				next_pos_emb = (
+					self.pos_emb
+					if uses_rotary_position(self.config, self.layers[next_att_idx].layer_id)
+					else None
+				)
 			else:
-				next_partial_index = next_partial_wq = next_skew_matrix = next_qproj = next_lr_k = next_lr_kproj = next_qnorm = None                
+				next_partial_index = next_partial_wq = next_skew_matrix = next_qproj = next_lr_k = next_lr_kproj = next_qnorm = next_pos_emb = None
 			self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
 				self.weight_read_buf[j], self.attention_mask[k], self.pos_emb, self.past_pos_emb,
 				self.cache_write_buf[j][k], i, k, self.speculation_stream,
 				partial(self.prefetch_cache, i, j, k, self.speculation_stream) if prefetch else None, 
 				partial(self.sync, 'load_kv', 'prefetch') if prefetch_sync else None, 
-				next_partial_index, next_partial_wq, next_skew_matrix, next_lr_kproj, next_qproj, next_qnorm, next_lr_k)
+				next_partial_index, next_partial_wq, next_skew_matrix, next_lr_kproj,
+				next_qproj, next_qnorm, next_lr_k, next_pos_emb)
 		else:
 			self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
 				self.weight_read_buf[j], self.attention_mask[k],
@@ -2006,6 +2076,21 @@ def run_flexgen(args):
 			dtype=torch.bfloat16,
 		)
 		print(f"Validated routed MoE layers: {routed_layers}", flush=True)
+		if config.model_type == "maple":
+			sequence = args.prompt_len + args.gen_len - 1
+			sliding_layers = sum(
+				not uses_persistent_kv(config, layer_id)
+				for layer_id in range(config.num_hidden_layers)
+			)
+			print(
+				"Maple KV policy: "
+				f"sliding_layers={sliding_layers}, "
+				f"window={config.sliding_window}, "
+				f"local_capacity={min(sequence, config.sliding_window - 1)}, "
+				f"global_layers={config.num_hidden_layers - sliding_layers}, "
+				"global_placement=configured",
+				flush=True,
+			)
 	elif args.expert_mode != "resident":
 		raise ValueError("--expert_mode=demand is supported only for routed MoE adapters")
 	########################################################
@@ -2089,7 +2174,9 @@ def run_flexgen(args):
 					args.alpha, bool(args.use_mmap), args.token_group,
 					args.att_comp_mode, args.moe_token_chunk_size)
 
-	cache_size = cache_bytes(config, num_prompts, args.prompt_len + args.gen_len, dtype_size=2)
+	cache_size = cache_bytes(
+		config, num_prompts, args.prompt_len + args.gen_len - 1, dtype_size=2
+	)
 	hidden_size = hidden_bytes(config, num_prompts, args.prompt_len + args.gen_len, dtype_size=2)
 	print("Cache size: {:.2f} MB".format(cache_size / 1024 / 1024))
 	print("Hidden size: {:.2f} MB".format(hidden_size / 1024 / 1024))

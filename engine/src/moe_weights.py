@@ -9,7 +9,10 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 
-from model_adapters import FFNKind, get_ffn_kind, get_qwen3_moe_layer_spec
+from model_adapters import (
+    FFNKind, get_ffn_kind, get_qwen3_moe_layer_spec, kv_cache_capacity,
+    uses_persistent_kv,
+)
 
 
 SAFETENSORS_DTYPE = {
@@ -411,20 +414,31 @@ def estimate_qwen3_moe_resident_memory(
     element_size = torch.empty((), dtype=dtype).element_size()
     total_batch = gpu_batch_size * num_gpu_batches
     sequence = prompt_len + gen_len - 1
-    kv_bytes = (
-        2
-        * total_batch
-        * sequence
-        * config.num_hidden_layers
-        * config.num_kv_heads
-        * config.head_dim
-        * element_size
+    bytes_per_token = (
+        2 * total_batch * config.num_kv_heads * config.head_dim * element_size
     )
+    if config.model_type == "maple":
+        local_kv_bytes = bytes_per_token * sum(
+            kv_cache_capacity(config, layer_id, sequence)
+            for layer_id in range(config.num_hidden_layers)
+            if not uses_persistent_kv(config, layer_id)
+        )
+        persistent_kv_bytes = bytes_per_token * sum(
+            kv_cache_capacity(config, layer_id, sequence)
+            for layer_id in range(config.num_hidden_layers)
+            if uses_persistent_kv(config, layer_id)
+        )
+    else:
+        local_kv_bytes = 0
+        persistent_kv_bytes = bytes_per_token * sequence * config.num_hidden_layers
     activation_bytes = total_batch * sequence * config.hidden_size * element_size * 3
     memory_kv = math.ceil(
-        kv_bytes * (cache_gpu_percent + cache_cpu_percent) / 100
+        local_kv_bytes
+        + persistent_kv_bytes * (cache_gpu_percent + cache_cpu_percent) / 100
     )
-    gpu_kv = math.ceil(kv_bytes * cache_gpu_percent / 100)
+    gpu_kv = math.ceil(
+        local_kv_bytes + persistent_kv_bytes * cache_gpu_percent / 100
+    )
     memory_activations = math.ceil(
         activation_bytes
         * (activation_gpu_percent + activation_cpu_percent)

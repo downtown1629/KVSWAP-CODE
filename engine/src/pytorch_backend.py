@@ -297,14 +297,18 @@ class TorchDevice:
 	@staticmethod
 	@torch.inference_mode()
 	def chuck_attn(q, k, v, scaling, flashatt, lr_proj_mode, 
-				   b, s, d, attention_mask, dev, n_head, head_dim, kv_rep, chunk_size):
+				   b, s, d, attention_mask, dev, n_head, head_dim, kv_rep, chunk_size,
+				   sliding_window=None):
 
 		eff_chunk = chunk_size if 0 < chunk_size < s else s
 		out = torch.empty(b, s, d, device=dev, dtype=q.dtype)
 
 		if not flashatt:
 			idx = torch.arange(s, device=dev)
-			attn_mask_full = attention_mask.data.view(b, 1, 1, s) & (idx <= idx.view(s, 1)).view(1, 1, s, s)
+			causal_mask = idx <= idx.view(s, 1)
+			if sliding_window is not None:
+				causal_mask &= idx >= (idx.view(s, 1) - sliding_window + 1)
+			attn_mask_full = attention_mask.data.view(b, 1, 1, s) & causal_mask.view(1, 1, s, s)
 			neg_inf = torch.finfo(q.dtype).min
 			key = repeat_kv(k, kv_rep, h_dim=2)
 			value = repeat_kv(v, kv_rep, h_dim=2)
@@ -314,9 +318,15 @@ class TorchDevice:
 			q_chunk = q[:, start:end]  # [b, chunk, h, head_dim]
 			chunk_len = end - start
 			
-			if flashatt:            
-				out[:, start:end] = flash_attn_func(q_chunk, k, v, 
-									causal=True, 
+			if flashatt:
+				# A shorter FlashAttention query is aligned to the end of K/V.
+				# Use the matching prefix so chunked prefill keeps absolute
+				# causal and sliding-window positions.
+				prefix_k = k[:, :end]
+				prefix_v = v[:, :end]
+				out[:, start:end] = flash_attn_func(q_chunk, prefix_k, prefix_v,
+									causal=True,
+									window_size=(sliding_window - 1, 0) if sliding_window else (-1, -1),
 									softmax_scale=scaling).reshape(b, chunk_len, d)
 			else:
 				tmp = torch.matmul(
@@ -338,7 +348,7 @@ class TorchDevice:
 				n_head, head_dim, scaling, kv_rep, pos_emb,
 				lr_proj_mode, donate, 
 				compress_cache, comp_config, flashatt, chunk_size,
-				rms_norm_eps=1e-5):
+				rms_norm_eps=1e-5, sliding_window=None):
 
 		b, s, d = inputs.shape
 		dtype = inputs.data.dtype
@@ -374,7 +384,8 @@ class TorchDevice:
 			q, k = apply_rotary_pos_emb(q, k, *pos_emb, layout='bshd')
 
 		out = TorchDevice.chuck_attn(q, k, v, scaling, flashatt, lr_proj_mode, 
-				   b, s, head_dim*n_head, attention_mask, self.dev, n_head, head_dim, kv_rep, chunk_size)
+				   b, s, head_dim*n_head, attention_mask, self.dev, n_head, head_dim,
+				   kv_rep, chunk_size, sliding_window=sliding_window)
 		del q
 			   
 		out = F.linear(out, w_out.data.to(dtype), bias=b_out.data.to(dtype) if b_out is not None else None)
@@ -423,6 +434,7 @@ class TorchDevice:
 	def mha_gen(self, inputs, attention_mask, 
 				w_q, b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, q_norm, k_norm,
 				n_head, head_dim, scaling, kv_rep, pos_emb, past_pos_emb,
+				speculation_pos_emb,
 				enable_pred, lr_proj_mode, next_lr_kproj, next_qproj, next_qnorm,
 				next_partial_index, next_partial_wq, skew_matrix,
 				kv_cache, next_lr_kcache, window_kv_buf, kv_window_index, 
@@ -460,13 +472,13 @@ class TorchDevice:
 					with torch.cuda.stream(spec_stream):
 						spec_stream.wait_event(event)
 						att_ins.prefetch_idx = speculate_attention(lr_proj_mode, spec_hidden_in, next_partial_wq, skew_matrix, 
-																	next_qproj, next_qnorm, next_lr_kproj, next_lr_kcache, pos_emb,
+															next_qproj, next_qnorm, next_lr_kproj, next_lr_kcache, speculation_pos_emb,
 																	next_partial_index, scaling,
 																	n_head, kv_rep, alpha, max_num_kv, token_group, 
 																		score_mode, rms_norm_eps=rms_norm_eps)
 				else:
 					att_ins.prefetch_idx = speculate_attention(lr_proj_mode, spec_hidden_in, next_partial_wq, skew_matrix, 
-																next_qproj, next_qnorm, next_lr_kproj, next_lr_kcache, pos_emb,
+														next_qproj, next_qnorm, next_lr_kproj, next_lr_kcache, speculation_pos_emb,
 																next_partial_index, scaling,
 																n_head, kv_rep, alpha, max_num_kv, token_group,
 																score_mode, rms_norm_eps=rms_norm_eps)

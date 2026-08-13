@@ -17,8 +17,8 @@ a Maple-specific artifact format. The resident fixed weights are approximately
 The adapter parses the pinned `config.json` directly and does not execute the
 repository's `trust_remote_code` modules during engine startup.
 
-The initial adapter was correctness-gated to 512 tokens. Layer-specific long
-context work follows [MAPLE_LONG_CONTEXT_CACHE_PLAN.md](MAPLE_LONG_CONTEXT_CACHE_PLAN.md):
+Layer-specific long-context handling follows
+[MAPLE_LONG_CONTEXT_CACHE_PLAN.md](MAPLE_LONG_CONTEXT_CACHE_PLAN.md):
 
 - Sliding layers retain only 511 prior KV entries and apply a 512-token prefill
   window; global NoPE layers retain the full history.
@@ -42,6 +42,7 @@ bash scripts/eval_maple_preview.sh download
 bash scripts/eval_maple_preview.sh pack
 bash scripts/eval_maple_preview.sh verify
 bash scripts/eval_maple_preview.sh smoke
+bash scripts/eval_maple_preview.sh long-smoke
 ```
 
 `pack` refuses to overwrite an existing store. `verify` is the explicit offline
@@ -57,3 +58,10 @@ materialize calls and 6,336 expert reads (39,862,665,216 logical bytes), and
 peaked at 3.296 GiB RSS. Total latency was 26.66 seconds. This proves bounded
 startup and end-to-end execution; real-checkpoint logits still require an
 independent large-memory reference parity run.
+
+The layer-specific cache policy also passed prompt-520/decode-2. It activated
+18 local SWA caches capped at 511 prior entries and six full-history global
+caches, planned 24.07 MiB total KV, produced `assistant`, and peaked at 3.668
+GiB RSS / 2.068 GiB CUDA allocated. This validates the 512-token rollover on
+Jetson; it is not a Hugging Face logit-parity result. Maple KVSwap selection is
+still blocked until a calibrated global-layer predictor is available.

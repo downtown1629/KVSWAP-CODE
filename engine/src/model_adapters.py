@@ -45,6 +45,35 @@ def uses_rotary_position(config, layer_id):
     return config.model_type != "opt"
 
 
+def sliding_window_for_layer(config, layer_id):
+    """Return the semantic attention window, or None for global attention."""
+    if not 0 <= layer_id < config.num_hidden_layers:
+        raise IndexError(
+            f"layer_id={layer_id} is outside [0, {config.num_hidden_layers})"
+        )
+    if (
+        config.model_type == "maple"
+        and config.layer_types[layer_id] == "sliding_attention"
+    ):
+        return int(config.sliding_window)
+    return None
+
+
+def kv_cache_capacity(config, layer_id, sequence_length):
+    """Number of prior-token KV entries retained persistently by a layer."""
+    if sequence_length < 0:
+        raise ValueError("sequence_length must be non-negative")
+    window = sliding_window_for_layer(config, layer_id)
+    if window is None:
+        return sequence_length
+    return min(sequence_length, window - 1)
+
+
+def uses_persistent_kv(config, layer_id):
+    """Whether old KV from this layer may be retained/offloaded globally."""
+    return sliding_window_for_layer(config, layer_id) is None
+
+
 def validate_maple_config(config):
     """Reject Maple variants whose semantics the initial adapter cannot match."""
     if getattr(config, "model_type", None) != "maple":
@@ -63,6 +92,8 @@ def validate_maple_config(config):
         raise ValueError("num_attention_heads must be divisible by num_kv_heads")
     if config.num_experts_per_tok > config.num_experts:
         raise ValueError("num_experts_per_tok cannot exceed num_experts")
+    if config.sliding_window < 2:
+        raise ValueError("Maple sliding_window must be at least 2")
     if getattr(config, "hidden_act", None) != "silu":
         raise ValueError("Maple adapter requires hidden_act=silu")
     if getattr(config, "attention_bias", None):
@@ -94,12 +125,6 @@ def validate_maple_run(config, prompt_len, gen_len, lr_proj_mode):
     """Keep the initial adapter inside semantics implemented by the engine."""
     if config.model_type != "maple":
         return config
-    if prompt_len + gen_len - 1 > config.sliding_window:
-        raise ValueError(
-            "the initial Maple adapter is correctness-gated only while "
-            "prompt_len + gen_len - 1 <= sliding_window; layer-specific "
-            "long-context SWA cache handling is not implemented"
-        )
     if lr_proj_mode != "none":
         raise ValueError(
             "Maple KV selection requires a separately calibrated predictor; "

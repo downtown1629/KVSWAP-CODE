@@ -22,7 +22,8 @@ check_revision() {
 case "$MODE" in
     static)
         python3 -m py_compile \
-            src/model_adapters.py src/model_config.py src/moe.py \
+            src/model_adapters.py src/model_config.py src/maple_cache.py \
+            src/moe.py src/main.py src/pytorch_backend.py \
             scripts/pack_maple_experts.py scripts/download_maple_preview.py
         PYTHONPATH=src "$PYTHON" -m unittest discover \
             -s tests -p 'test_maple_adapter.py'
@@ -78,8 +79,45 @@ if peak is None or float(peak.group(1)) >= 4.5:
 print(f"Maple smoke verified: output=We need, RSS={peak.group(1)} GiB")
 PY
         ;;
+    long-smoke)
+        check_revision
+        free -h
+        OFFLOAD_DIR=$(mktemp -d /tmp/kvswap-maple-long-offload.XXXXXX)
+        RUN_LOG=$(mktemp /tmp/kvswap-maple-long-smoke.XXXXXX)
+        MAX_ALLOC_KV_SIZE=67108864 "$PYTHON" src/main.py \
+            --model_path "$MODEL" --offload_dir "$OFFLOAD_DIR" \
+            --prompt_len 520 --gen_len 2 --gpu_batch_size 1 --num_gpu_batches 1 \
+            --percent 100 0 100 0 100 0 --test_input_path ./data/test_inputs \
+            --run_args L0 --lr_proj_mode none --use_token_cache 0 \
+            --dk_wr none --dk_rd none --token_group 1 --disk_dev_name nvme \
+            --batch_split 1 --seed 1234 --flash_att 1 --paged_att 0 --nv_profile 0 \
+            --expert_mode demand --moe_expert_store "$STORE" \
+            --moe_checkpoint_revision "$REVISION" --moe_expert_reader direct \
+            --moe_expert_scratch_slots 64 --moe_demand_weight_limit_gb 2.2 \
+            --moe_system_headroom_gb 1.5 --moe_token_chunk_size 8 \
+            >"$RUN_LOG" 2>&1
+        cat "$RUN_LOG"
+        "$PYTHON" - "$RUN_LOG" <<'PY'
+import re
+import sys
+
+text = open(sys.argv[1]).read()
+policy = (
+    "Maple KV policy: sliding_layers=18, window=512, "
+    "local_capacity=511, global_layers=6, global_placement=configured"
+)
+if policy not in text:
+    raise SystemExit("Maple long-context cache policy was not activated")
+if re.search(r"^0: \S", text, re.MULTILINE) is None:
+    raise SystemExit("Maple long-context run did not produce a token")
+peak = re.search(r"Peak Memory \(GB\) RSS: ([0-9.]+)", text)
+if peak is None or float(peak.group(1)) >= 5.5:
+    raise SystemExit(f"missing or unsafe Maple peak RSS: {peak.group(1) if peak else None}")
+print(f"Maple long-context smoke verified: prompt=520, RSS={peak.group(1)} GiB")
+PY
+        ;;
     *)
-        echo "usage: $0 {static|download|pack|verify|smoke}" >&2
+        echo "usage: $0 {static|download|pack|verify|smoke|long-smoke}" >&2
         exit 2
         ;;
 esac

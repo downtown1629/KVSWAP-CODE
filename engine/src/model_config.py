@@ -6,11 +6,19 @@ from types import SimpleNamespace
 from transformers import AutoConfig
 import numpy as np
 import argparse
-from model_adapters import validate_maple_config, validate_qwen3_moe_config
+from model_adapters import (
+    kv_cache_capacity, validate_maple_config, validate_qwen3_moe_config,
+)
 
 def cache_bytes(config, batch_size, seq_len, dtype_size=2, num_layers=None):
     num_layers = config.num_hidden_layers if num_layers is None else num_layers
     hidden_size = config.head_dim * config.num_attention_heads // config.num_kv_groups
+    if config.model_type == "maple":
+        retained_tokens = sum(
+            kv_cache_capacity(config, layer_id, seq_len)
+            for layer_id in range(num_layers)
+        )
+        return 2 * batch_size * retained_tokens * hidden_size * dtype_size
     return 2 * batch_size * seq_len * num_layers * hidden_size * dtype_size
 
 def hidden_bytes(config, batch_size, seq_len, dtype_size=2):

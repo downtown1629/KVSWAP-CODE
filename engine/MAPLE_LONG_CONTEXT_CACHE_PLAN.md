@@ -28,13 +28,22 @@ global layer's NoPE rule must also apply to predictor scoring.
 
 ## Validation gates
 
-1. Static config tests confirm the 3:1 schedule and per-layer capacities.
-2. Functional attention tests compare windowed prefill with a PyTorch mask.
-3. Cache tests cover prompt truncation, decode append, and rollover at 512.
-4. Existing Qwen/M2 tests remain unchanged.
-5. Jetson validation starts just beyond the boundary (prompt 520, decode 2),
-   then increases only while preflight retains explicit OS headroom.
+1. [x] Static config tests confirm the 3:1 schedule and per-layer capacities.
+2. [x] Functional attention tests compare windowed prefill with a PyTorch mask
+   and verify chunked FlashAttention receives the correct K/V prefix.
+3. [x] Cache tests cover prompt truncation, decode append, and rollover.
+4. [x] Existing MoE and expert-store tests remain unchanged.
+5. [x] Jetson validation just beyond the boundary (prompt 520, decode 2)
+   retains explicit OS headroom.
 
 The first implementation remains BF16 and synchronous for experts. It does not
 invent a Maple KV predictor; KVSwap global-layer execution requires a separately
 calibrated predictor artifact.
+
+## Jetson evidence
+
+The pinned Maple checkpoint completed prompt 520/decode 2 with 18 bounded SWA
+layers and six full-history global layers. The run planned 24.07 MiB of KV,
+produced `assistant`, and peaked at 3.668 GiB RSS / 2.068 GiB CUDA allocated.
+It reported no swap and no KV disk synchronization during decode. Expert demand
+loading remained separate: 1,584 materializations and 50,316 extent reads.
