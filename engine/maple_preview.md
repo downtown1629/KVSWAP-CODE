@@ -77,6 +77,10 @@ driver errors and loss of local console output.
 
 For a token/layer Gantt trace, use the non-root software-only wrapper:
 
+The trace hierarchy, token semantics, current naive expert-demand path, and
+measured bottlenecks are documented in
+[MAPLE_GANTT_TRACE_GUIDE.md](MAPLE_GANTT_TRACE_GUIDE.md).
+
 ```bash
 cd engine
 bash scripts/profile_maple_nsys.sh 32 4
