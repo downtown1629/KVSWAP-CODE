@@ -17,18 +17,21 @@ a Maple-specific artifact format. The resident fixed weights are approximately
 The adapter parses the pinned `config.json` directly and does not execute the
 repository's `trust_remote_code` modules during engine startup.
 
-The initial correctness boundary is intentionally narrow:
+The initial adapter was correctness-gated to 512 tokens. Layer-specific long
+context work follows [MAPLE_LONG_CONTEXT_CACHE_PLAN.md](MAPLE_LONG_CONTEXT_CACHE_PLAN.md):
 
-- `prompt_len + gen_len - 1` must not exceed the 512-token sliding window.
-- `--lr_proj_mode none` is required; Maple has no calibrated KVSwap predictor.
+- Sliding layers retain only 511 prior KV entries and apply a 512-token prefill
+  window; global NoPE layers retain the full history.
+- KVSwap storage/selection is reserved for global layers. A calibrated Maple
+  predictor is still required before using a non-`none` `lr_proj_mode`.
 - Expert weights remain BF16. Ternary packing/dequantization is not inferred
   from the model card.
 - The first real run is an engine smoke test, not Hugging Face parity. The public
   reference requires Triton/FlashAttention and cannot fit concurrently on an
   8 GiB Orin Nano.
 
-These guards prevent the current full-cache attention path from silently
-pretending to implement long-context 3:1 SWA/global cache semantics.
+This separation prevents sliding layers from reading or storing out-of-window
+KV while preserving the complete history needed by global layers.
 
 ## Prepare and run
 
