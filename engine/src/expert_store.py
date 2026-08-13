@@ -1,9 +1,11 @@
-"""Lossless Qwen3-MoE expert artifacts and synchronous demand loading.
+"""Lossless BF16 routed-MoE artifacts and synchronous demand loading.
 
 M2 deliberately keeps this path independent from KVSwap's token-group disk
 abstractions.  An expert is one aligned extent containing gate/up/down BF16
 weights.  A factory shares one staging buffer and one bounded CUDA scratch bank
-across sequential MoE layers, so memory does not grow with layer count.
+across sequential MoE layers, so memory does not grow with layer count. Qwen3
+and Maple currently share the same physical gate/up/down extent layout while
+retaining family-specific manifest format IDs.
 """
 
 from __future__ import annotations
@@ -28,6 +30,10 @@ from moe import MaterializedExperts
 
 
 FORMAT_VERSION = "kvswap-qwen3-moe-expert-store-v1"
+FORMAT_VERSIONS = {
+    "qwen3_moe": FORMAT_VERSION,
+    "maple": "kvswap-maple-expert-store-v1",
+}
 REPRESENTATION = "bf16"
 COMPONENTS = ("gate_proj", "up_proj", "down_proj")
 DEFAULT_ALIGNMENT = 4096
@@ -251,7 +257,15 @@ class ExpertStore:
             manifest = json.loads(manifest_path.read_text())
         except FileNotFoundError as error:
             raise FileNotFoundError(f"missing expert manifest: {manifest_path}") from error
-        if manifest.get("format") != FORMAT_VERSION:
+        expected_format = (
+            FORMAT_VERSIONS.get(config.model_type) if config is not None else None
+        )
+        if expected_format is None:
+            supported_formats = set(FORMAT_VERSIONS.values())
+            valid_format = manifest.get("format") in supported_formats
+        else:
+            valid_format = manifest.get("format") == expected_format
+        if not valid_format:
             raise ValueError(f"unsupported expert store format: {manifest.get('format')!r}")
         if manifest.get("representation") != REPRESENTATION:
             raise ValueError("M2 supports only lossless BF16 expert stores")
@@ -543,7 +557,7 @@ def pack_qwen3_expert_store(checkpoint, config, output_dir, alignment=DEFAULT_AL
         published_data = True
         identity, fingerprint = _config_identity(config)
         manifest = {
-            "format": FORMAT_VERSION,
+            "format": FORMAT_VERSIONS.get(config.model_type, FORMAT_VERSION),
             "representation": REPRESENTATION,
             "alignment": alignment,
             "config": identity,
@@ -576,6 +590,10 @@ def pack_qwen3_expert_store(checkpoint, config, output_dir, alignment=DEFAULT_AL
         output_dir, config=config, expected_source_revision=source_revision,
         expected_fixed_checkpoint_digest=fixed_checkpoint_digest,
     )
+
+
+# Both supported families currently use identical BF16 gate/up/down extents.
+pack_bf16_expert_store = pack_qwen3_expert_store
 
 
 class SynchronousExtentReader:
@@ -875,7 +893,7 @@ class DemandExpertProvider:
         return self.workspace.materialize(self.layer_id, selected_expert_ids)
 
 
-class Qwen3DemandExpertProviderFactory:
+class RoutedMoeDemandExpertProviderFactory:
     """Factory sharing one bounded workspace across sequential routed layers."""
 
     def __init__(self, store, config, slots, direct=False, verify_reads=False):
@@ -899,3 +917,7 @@ class Qwen3DemandExpertProviderFactory:
     def close(self):
         if self.workspace is not None:
             self.workspace.close()
+
+
+# Compatibility name for M2 callers and external scripts.
+Qwen3DemandExpertProviderFactory = RoutedMoeDemandExpertProviderFactory

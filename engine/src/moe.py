@@ -125,7 +125,9 @@ class RoutingResult:
     topk_weights: torch.Tensor
 
 
-def route_qwen3_moe(hidden_states, router_weight, top_k, norm_topk_prob):
+def route_qwen3_moe(
+    hidden_states, router_weight, top_k, norm_topk_prob, router_fp32=False
+):
     hidden_size = hidden_states.shape[-1]
     if router_weight.ndim != 2 or router_weight.shape[1] != hidden_size:
         raise ValueError("router_weight must have shape [num_experts, hidden_size]")
@@ -133,12 +135,16 @@ def route_qwen3_moe(hidden_states, router_weight, top_k, norm_topk_prob):
         raise ValueError("top_k must be between 1 and num_experts")
 
     flat_hidden = hidden_states.reshape(-1, hidden_size)
-    router_logits = F.linear(flat_hidden, router_weight)
+    if router_fp32:
+        router_logits = F.linear(flat_hidden.float(), router_weight.float())
+    else:
+        router_logits = F.linear(flat_hidden, router_weight)
     routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
     topk_weights, topk_ids = torch.topk(routing_weights, top_k, dim=-1)
     if norm_topk_prob:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-    topk_weights = topk_weights.to(hidden_states.dtype)
+    if not router_fp32:
+        topk_weights = topk_weights.to(hidden_states.dtype)
     return RoutingResult(router_logits, topk_ids, topk_weights)
 
 
@@ -148,16 +154,20 @@ def qwen3_moe_forward(
     expert_provider: ExpertProvider,
     top_k,
     norm_topk_prob,
+    expert_clamp=False,
+    router_fp32=False,
 ):
     """Match Qwen3MoeSparseMoeBlock for a fixed input tensor."""
     original_shape = hidden_states.shape
     hidden_size = original_shape[-1]
     flat_hidden = hidden_states.reshape(-1, hidden_size)
     routing = route_qwen3_moe(
-        hidden_states, router_weight, top_k, norm_topk_prob
+        hidden_states, router_weight, top_k, norm_topk_prob,
+        router_fp32=router_fp32,
     )
     experts = expert_provider.materialize(routing.topk_ids)
-    final_hidden = torch.zeros_like(flat_hidden)
+    accumulation_dtype = torch.float32 if router_fp32 else flat_hidden.dtype
+    final_hidden = torch.zeros_like(flat_hidden, dtype=accumulation_dtype)
 
     for global_id_tensor in torch.unique(routing.topk_ids):
         global_id = int(global_id_tensor.item())
@@ -172,15 +182,19 @@ def qwen3_moe_forward(
         )
         with nvtx.annotate(f"COMPUTE_EXPERT expert={global_id}", color="green"):
             current = flat_hidden.index_select(0, token_indices)
-            gate = F.silu(F.linear(current, experts.gate_proj[slot]))
+            gate_linear = F.linear(current, experts.gate_proj[slot])
             up = F.linear(current, experts.up_proj[slot])
+            if expert_clamp:
+                gate_linear = torch.clamp(gate_linear, max=7.0)
+                up = torch.clamp(up, min=-7.0, max=7.0)
+            gate = F.silu(gate_linear)
             expert_output = F.linear(gate * up, experts.down_proj[slot])
-            expert_output = expert_output * routing.topk_weights[
+            expert_output = expert_output.to(accumulation_dtype) * routing.topk_weights[
                 token_indices, topk_positions, None
-            ]
+            ].to(accumulation_dtype)
             final_hidden.index_add_(0, token_indices, expert_output)
 
-    return final_hidden.reshape(original_shape), routing
+    return final_hidden.to(hidden_states.dtype).reshape(original_shape), routing
 
 
 def rms_norm_reference(hidden_states, weight, eps):
@@ -200,6 +214,8 @@ def qwen3_moe_layer_forward(
     top_k,
     norm_topk_prob,
     rms_norm_eps,
+    expert_clamp=False,
+    router_fp32=False,
 ):
     """Apply Qwen3-MoE post-attention norm, routed FFN, and residual."""
     residual = hidden_states
@@ -212,6 +228,8 @@ def qwen3_moe_layer_forward(
         expert_provider,
         top_k,
         norm_topk_prob,
+        expert_clamp=expert_clamp,
+        router_fp32=router_fp32,
     )
     return residual + moe_output, routing
 
@@ -225,6 +243,8 @@ def qwen3_moe_layer_forward_chunked(
     norm_topk_prob,
     rms_norm_eps,
     token_chunk_size,
+    expert_clamp=False,
+    router_fp32=False,
 ):
     """Bound prefill temporaries while preserving token-independent semantics."""
     if token_chunk_size <= 0:
@@ -240,6 +260,8 @@ def qwen3_moe_layer_forward_chunked(
             top_k,
             norm_topk_prob,
             rms_norm_eps,
+            expert_clamp=expert_clamp,
+            router_fp32=router_fp32,
         )
 
     outputs = []
@@ -253,6 +275,8 @@ def qwen3_moe_layer_forward_chunked(
             top_k,
             norm_topk_prob,
             rms_norm_eps,
+            expert_clamp=expert_clamp,
+            router_fp32=router_fp32,
         )
         outputs.append(output)
         routings.append(routing)

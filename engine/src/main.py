@@ -29,7 +29,10 @@ from methods import merge_qk_weight, get_partial_q_weight, speculate_attention, 
 from model_utils import rms_norm
 import torch.nn.functional as F
 from cache_manager import CacheManager
-from model_adapters import FFNKind, get_ffn_kind, is_qwen3_family
+from model_adapters import (
+	FFNKind, get_ffn_kind, has_qk_norm, is_qwen3_family,
+	is_routed_moe_model, uses_rotary_position, validate_maple_run,
+)
 from moe import (
 	ResidentExpertProvider,
 	TracingExpertProvider,
@@ -37,7 +40,7 @@ from moe import (
 )
 from expert_store import (
 	ExpertStore,
-	Qwen3DemandExpertProviderFactory,
+	RoutedMoeDemandExpertProviderFactory,
 	estimate_qwen3_moe_demand_memory,
 	qwen3_expert_logical_bytes,
 	qwen3_fixed_checkpoint_digest,
@@ -144,9 +147,9 @@ def init_weight_list(weight_specs, policy, env, config, checkpoint=None):
 	sizes_cumsum = np.cumsum(sizes)
 	ret = []
 	direct_destinations = {}
-	direct_safetensors = config.model_type == 'qwen3_moe'
+	direct_safetensors = is_routed_moe_model(config.model_type)
 	if direct_safetensors and checkpoint is None:
-		raise ValueError("qwen3_moe requires a preflighted weight checkpoint")
+		raise ValueError("routed MoE requires a preflighted weight checkpoint")
 	for i in range(len(weight_specs)):
 		mid_percent = (sizes_cumsum[i] - sizes[i] / 2) / sizes_cumsum[-1]
 		home = get_choice(mid_percent * 100, dev_percents, dev_choices)
@@ -205,7 +208,9 @@ class InputEmbed:
 			]
 		else:
 			weight_specs = [
-				((v, h), dtype, path + "model.embed_tokens.weight"),
+				((v, h), dtype, path + getattr(
+					self.config, "embedding_weight_name", "model.embed_tokens.weight"
+				)),
 			]           
 		weights = init_weight_list(
 			weight_specs, self.policy, self.env, self.config, self.checkpoint
@@ -294,7 +299,9 @@ class OutputEmbed:
 		else:
 			weight_specs = [
 				((h,), dtype, path + "model.norm.weight"),
-				((v, h), dtype, path + "model.embed_tokens.weight" if self.config.tie_word_embeddings else path + "lm_head.weight")
+				((v, h), dtype, path + getattr(
+					self.config, "embedding_weight_name", "model.embed_tokens.weight"
+				) if self.config.tie_word_embeddings else path + "lm_head.weight")
 			]
 		weights = init_weight_list(
 			weight_specs, self.policy, self.env, self.config, self.checkpoint
@@ -381,7 +388,7 @@ class SelfAttention:
 				self.partial_index = torch.load(skew_partial_idx_path+f'/{layer_id}.pt', 
 												map_location=self.compute.dev).to(torch.long)
 			elif self.lr_proj_mode.startswith('lr_proj'):
-				dtype = torch.bfloat16 if (self.config.model_type == 'qwen2' or is_qwen3_family(self.config.model_type)) and self.config.dtype == np.float16 else torch.float16
+				dtype = torch.bfloat16 if (self.config.model_type == 'qwen2' or has_qk_norm(self.config.model_type)) and self.config.dtype == np.float16 else torch.float16
 				self.lr_kproj = torch.load(lr_proj_path+f'/lr_kproj_{layer_id}.pt', map_location=self.compute.dev).to(dtype)
 
 	def set_task(self, task):
@@ -459,7 +466,7 @@ class SelfAttention:
 					weight_specs, self.policy, self.env, self.config, self.checkpoint
 				)
 	
-			if is_qwen3_family(self.config.model_type):
+			if has_qk_norm(self.config.model_type):
 				weight_specs = [
 					((self.config.head_dim,), dtype, path + ".self_attn.q_norm.weight"),
 					((self.config.head_dim,), dtype, path + ".self_attn.k_norm.weight"),
@@ -469,7 +476,7 @@ class SelfAttention:
 				)
 	
 		if self.layer_id > 0 or self.en_pred_emb:
-			if self.lr_proj_mode != 'none' and is_qwen3_family(self.config.model_type):
+			if self.lr_proj_mode != 'none' and has_qk_norm(self.config.model_type):
 				self.qnorm = weights[-2].data
 	  
 			if self.lr_proj_mode == 'base':
@@ -529,7 +536,7 @@ class SelfAttention:
 								w_norm.smart_copy(dst2), (None, None),
 								(None, None), (None, None))
 			else:     
-				if is_qwen3_family(self.config.model_type):
+				if has_qk_norm(self.config.model_type):
 					w_q, w_k, w_v, w_out, w_norm, q_norm, k_norm = weight_home.val
 					if CONCAT_PROJ_WEIGHT:
 						raise NotImplementedError()
@@ -576,7 +583,7 @@ class SelfAttention:
 			elif self.policy.use_token_cache:
 				return
 		
-		force_bf16 = (self.config.model_type == 'qwen2' or is_qwen3_family(self.config.model_type)) and self.config.dtype == np.float16
+		force_bf16 = (self.config.model_type == 'qwen2' or has_qk_norm(self.config.model_type)) and self.config.dtype == np.float16
 		if '0' in self.policy.start_layer:
 			if 'emb' in self.policy.start_layer:
 				start_layer = -1
@@ -834,13 +841,19 @@ class SelfAttention:
 	 				(b_ln, _), (q_norm, _), (k_norm, _)) = weight_read_buf.val           
 				
 		w_tuple = (w_q, b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, q_norm, k_norm)
+		layer_pos_emb = pos_emb
+		layer_past_pos_emb = past_pos_emb
+		if not uses_rotary_position(self.config, self.layer_id):
+			# Maple deliberately uses NoPE on its global-attention layers.
+			layer_pos_emb = None
+			layer_past_pos_emb = None
 		
 		if i == 0:  # prefill
 			mask, donate[1] = attention_mask.val.smart_copy(self.compute)
 			h, new_k_cache, new_v_cache = self.compute.mha(h, mask, *w_tuple, 
 															self.config.num_attention_heads, 
 															self.config.head_dim, self.config.scaling, 
-															self.config.num_kv_groups, pos_emb, 
+																	self.config.num_kv_groups, layer_pos_emb,
 															self.lr_proj_mode,
 															donate, self.policy.compress_cache, self.policy.comp_cache_config, 
 																	self.policy.flash_att, self.chunk_size,
@@ -870,7 +883,7 @@ class SelfAttention:
 				kv_cache.layer_id = self.layer_id
 			h, new_k_cache, new_v_cache = self.compute.mha_gen(h, mask, *w_tuple, 
 																self.config.num_attention_heads, self.config.head_dim, self.config.scaling, 
-																self.config.num_kv_groups, pos_emb, past_pos_emb,
+																	self.config.num_kv_groups, layer_pos_emb, layer_past_pos_emb,
 																self.enable_pred, self.lr_proj_mode, next_lr_kproj, next_qproj, next_qnorm,
 																next_partial_index, next_partial_wq, next_skew_matrix,
 																kv_cache, next_lr_k_input, self.window_kv_buf, self.kv_window_index,
@@ -999,7 +1012,7 @@ class MLP:
 		hidden.val = h
 
 
-class Qwen3ResidentExpertProviderFactory:
+class RoutedMoeResidentExpertProviderFactory:
 	"""M1 expert storage owner; M2 replaces this with demand materialization."""
 
 	def __init__(self, checkpoint, config):
@@ -1019,8 +1032,12 @@ class Qwen3ResidentExpertProviderFactory:
 		)
 
 
+# Compatibility name retained for the original Qwen3 M1 wiring.
+Qwen3ResidentExpertProviderFactory = RoutedMoeResidentExpertProviderFactory
+
+
 class MoEBlock:
-	"""Qwen3-MoE FFN using a resident or synchronous-demand provider."""
+	"""Routed FFN using a resident or synchronous-demand expert provider."""
 
 	def __init__(self, config, env, policy, layer_id, checkpoint,
 				 expert_provider_factory, expert_trace_path="none"):
@@ -1093,6 +1110,8 @@ class MoEBlock:
 				norm_topk_prob=self.config.norm_topk_prob,
 				rms_norm_eps=self.config.rms_norm_eps,
 				token_chunk_size=self.policy.moe_token_chunk_size,
+				expert_clamp=getattr(self.config, "expert_clamp", False),
+				router_fp32=getattr(self.config, "router_fp32", False),
 			)
 		h.data = output
 		hidden.val = h
@@ -1131,6 +1150,10 @@ class LM:
 				from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding as RotaryEmbedding
 			elif self.config.model_type == 'qwen3_moe':
 				from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRotaryEmbedding as RotaryEmbedding
+			elif self.config.model_type == 'maple':
+				# Maple's public implementation uses the same Transformers RoPE
+				# initializer, including partial_rotary_factor.
+				from transformers.models.qwen2.modeling_qwen2 import Qwen2RotaryEmbedding as RotaryEmbedding
 			else:
 				from transformers.models.qwen2.modeling_qwen2 import Qwen2RotaryEmbedding as RotaryEmbedding
 			# self.rotary_emb = RotaryEmbedding(dim=config.head_dim, 
@@ -1141,9 +1164,9 @@ class LM:
 		self.moe_checkpoint = moe_checkpoint
 		self.expert_provider_factory = expert_provider_factory
 		self.expert_trace_path = expert_trace_path
-		if self.config.model_type == 'qwen3_moe':
+		if is_routed_moe_model(self.config.model_type):
 			if self.moe_checkpoint is None:
-				raise ValueError("qwen3_moe requires a preflighted safetensors checkpoint")
+				raise ValueError("routed MoE requires a preflighted safetensors checkpoint")
 			if self.expert_provider_factory is None:
 				resident_expert_bytes = sum(
 					qwen3_moe_layer_bytes(self.config, layer_id)
@@ -1151,11 +1174,11 @@ class LM:
 					if get_ffn_kind(self.config, layer_id) == FFNKind.ROUTED_MOE
 				)
 				print(
-					f"Qwen3-MoE resident router/expert/norm bytes: "
+					f"{self.config.model_type} resident router/expert/norm bytes: "
 					f"{resident_expert_bytes / GB:.3f} GB",
 					flush=True,
 				)
-				self.expert_provider_factory = Qwen3ResidentExpertProviderFactory(
+				self.expert_provider_factory = RoutedMoeResidentExpertProviderFactory(
 					self.moe_checkpoint, self.config
 				)
 
@@ -1816,6 +1839,12 @@ def get_inputs(prompt_len, num_prompts, tokenizer, path, model_type, seed):
 					add_generation_prompt=True,
 					enable_thinking=False 
 				)
+			elif model_type == "maple":
+				text = tokenizer.apply_chat_template(
+					messages,
+					tokenize=False,
+					add_generation_prompt=True,
+				)
 			else:
 				raise ValueError(f"Unknown model type: {model_type}")
 			input_ids = tokenizer.encode(text)
@@ -1849,12 +1878,13 @@ def run_flexgen(args):
 	config = get_model_config(args.model_path)
 	moe_checkpoint = None
 	moe_expert_store = None
-	if config.model_type == 'qwen3_moe':
+	if is_routed_moe_model(config.model_type):
 		if args.percent[0] != 100 or args.percent[1] != 0:
 			raise ValueError(
-				"Qwen3-MoE requires fixed weights on GPU "
+				f"{config.model_type} requires fixed weights on GPU "
 				"(--percent first two values must be 100 0)"
 			)
+		validate_maple_run(config, args.prompt_len, args.gen_len, args.lr_proj_mode)
 		moe_index = SafetensorIndex(args.model_path)
 		validate_qwen3_moe_index(moe_index, config, dtype=torch.bfloat16)
 		if args.expert_mode == "resident":
@@ -1935,21 +1965,22 @@ def run_flexgen(args):
 		)
 		if args.expert_mode == "demand":
 			# Capacity is approved before shards are opened. This then streams only
-			# fixed/router tensors, never the 54 GiB expert bank.
+			# fixed/router tensors, never the source expert bank.
 			moe_checkpoint = SafetensorCheckpoint(args.model_path)
 			fixed_checkpoint_digest = qwen3_fixed_checkpoint_digest(
 				moe_checkpoint, config, dtype=torch.bfloat16
 			)
 			if fixed_checkpoint_digest != moe_expert_store.fixed_checkpoint_digest:
 				raise ValueError("expert store fixed checkpoint digest mismatch")
+		model_label = "Maple" if config.model_type == "maple" else "Qwen3-MoE"
 		print(
-			f"Qwen3-MoE {args.expert_mode} weight approval: "
+			f"{model_label} {args.expert_mode} weight approval: "
 			f"{approved_weight_bytes / GB:.3f} GiB within "
 			f"{approval_limit_gb:.3f} GiB limit",
 			flush=True,
 		)
 		print(
-			f"Qwen3-MoE capacity preflight: system="
+			f"{model_label} capacity preflight: system="
 			f"{memory_plan.system_required / GB:.3f}/{available_bytes / GB:.3f} "
 			f"GiB available, cuda={memory_plan.cuda_required / GB:.3f}/"
 			f"{total_bytes * 0.85 / GB:.3f} GiB allocator limit, "
@@ -1959,7 +1990,7 @@ def run_flexgen(args):
 		)
 		if args.expert_mode == "demand":
 			print(
-				f"Qwen3-MoE demand store: extents={len(moe_expert_store.extents)}, "
+				f"{model_label} demand store: extents={len(moe_expert_store.extents)}, "
 				f"scratch_slots={scratch_slots}, "
 				f"expert_bytes={qwen3_expert_logical_bytes(config) / GB:.3f} GiB, "
 				f"reader={args.moe_expert_reader}",
@@ -1976,7 +2007,7 @@ def run_flexgen(args):
 		)
 		print(f"Validated routed MoE layers: {routed_layers}", flush=True)
 	elif args.expert_mode != "resident":
-		raise ValueError("--expert_mode=demand is supported only for qwen3_moe")
+		raise ValueError("--expert_mode=demand is supported only for routed MoE adapters")
 	########################################################
 	tokenizer = AutoTokenizer.from_pretrained(args.model_path, padding_side="left")
 	if not hasattr(tokenizer, 'pad_token') or tokenizer.pad_token is None:
@@ -2076,8 +2107,8 @@ def run_flexgen(args):
 		
 	skew_paths = (args.skew_partial_idx_path, args.skew_matrix_path)
 	expert_provider_factory = None
-	if config.model_type == 'qwen3_moe' and args.expert_mode == 'demand':
-		expert_provider_factory = Qwen3DemandExpertProviderFactory(
+	if is_routed_moe_model(config.model_type) and args.expert_mode == 'demand':
+		expert_provider_factory = RoutedMoeDemandExpertProviderFactory(
 			moe_expert_store,
 			config,
 			slots=scratch_slots,

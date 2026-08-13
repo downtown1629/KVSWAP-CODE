@@ -314,11 +314,14 @@ def qwen3_moe_resident_expected(config, dtype=torch.bfloat16):
     query_width = int(config.num_attention_heads) * head_dim
     kv_width = int(config.num_kv_heads) * head_dim
     expected = {
-        "model.embed_tokens.weight": ((int(config.vocab_size), hidden), dtype),
+        getattr(config, "embedding_weight_name", "model.embed_tokens.weight"): (
+            (int(config.vocab_size), hidden), dtype
+        ),
         "model.norm.weight": ((hidden,), dtype),
     }
     output_name = (
-        "model.embed_tokens.weight" if config.tie_word_embeddings else "lm_head.weight"
+        getattr(config, "embedding_weight_name", "model.embed_tokens.weight")
+        if config.tie_word_embeddings else "lm_head.weight"
     )
     expected[output_name] = ((int(config.vocab_size), hidden), dtype)
 

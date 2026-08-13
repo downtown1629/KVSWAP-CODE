@@ -1,8 +1,12 @@
 
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
 from transformers import AutoConfig
 import numpy as np
 import argparse
-from model_adapters import validate_qwen3_moe_config
+from model_adapters import validate_maple_config, validate_qwen3_moe_config
 
 def cache_bytes(config, batch_size, seq_len, dtype_size=2, num_layers=None):
     num_layers = config.num_hidden_layers if num_layers is None else num_layers
@@ -13,11 +17,47 @@ def hidden_bytes(config, batch_size, seq_len, dtype_size=2):
     return batch_size * seq_len * config.hidden_size * dtype_size
 
 def get_model_config(model_path):
-    config = AutoConfig.from_pretrained(model_path)
+    config_path = Path(model_path) / "config.json"
+    raw_config = json.loads(config_path.read_text()) if config_path.is_file() else None
+    is_maple_config = raw_config is not None and (
+        raw_config.get("model_type") == "maple"
+        or raw_config.get("architectures") == ["MapleForCausalLM"]
+    )
+    if is_maple_config:
+        # The engine only needs declarative fields. Do not execute Maple's
+        # trust_remote_code modules merely to read config.json.
+        config = SimpleNamespace(**{**raw_config, "model_type": "maple"})
+    else:
+        config = AutoConfig.from_pretrained(model_path)
     model_name = model_path.split('/')[-1]
     hf_model_type = getattr(config, 'model_type', '')
     model_config = argparse.Namespace()
-    if hf_model_type == 'qwen3_moe':
+    if hf_model_type == 'maple':
+        model_config.model_type = 'maple'
+        model_config.attention_bias = False
+        model_config.intermediate_size = config.intermediate_size
+        model_config.moe_intermediate_size = config.moe_intermediate_size
+        model_config.hidden_act = config.hidden_act
+        model_config.max_position_embeddings = config.max_position_embeddings
+        model_config.tie_word_embeddings = config.tie_word_embeddings
+        model_config.pad_token_id = config.pad_token_id if config.pad_token_id is not None else config.eos_token_id
+        model_config.rope_scaling = config.rope_scaling
+        model_config.rope_theta = config.rope_theta
+        model_config.num_experts = config.num_experts
+        model_config.num_experts_per_tok = config.num_experts_per_tok
+        model_config.num_shared_experts = config.num_shared_experts
+        model_config.norm_topk_prob = config.norm_topk_prob
+        model_config.decoder_sparse_step = 1
+        model_config.mlp_only_layers = []
+        model_config.layer_types = list(config.layer_types)
+        model_config.sliding_window = config.sliding_window
+        model_config.partial_rotary_factor = config.partial_rotary_factor
+        model_config.nope_on_global_attention = config.nope_on_global_attention
+        model_config.use_qk_norm = config.use_qk_norm
+        model_config.router_fp32 = config.router_dtype == 'fp32'
+        model_config.embedding_weight_name = 'model.word_embeddings.weight'
+        model_config.expert_clamp = True
+    elif hf_model_type == 'qwen3_moe':
         model_config.model_type = 'qwen3_moe'
         model_config.attention_bias = config.attention_bias
         model_config.intermediate_size = config.intermediate_size
@@ -88,4 +128,6 @@ def get_model_config(model_path):
         model_config.rms_norm_eps = config.rms_norm_eps
     if model_config.model_type == 'qwen3_moe':
         validate_qwen3_moe_config(model_config)
+    elif model_config.model_type == 'maple':
+        validate_maple_config(model_config)
     return model_config

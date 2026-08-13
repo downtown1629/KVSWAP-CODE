@@ -38,7 +38,7 @@ class MoEMainWiringStaticTest(unittest.TestCase):
             node
             for node in self.tree.body
             if isinstance(node, ast.ClassDef)
-            and node.name == "Qwen3ResidentExpertProviderFactory"
+            and node.name == "RoutedMoeResidentExpertProviderFactory"
         )
         create = next(
             node
@@ -205,7 +205,7 @@ class MoEMainWiringStaticTest(unittest.TestCase):
         self.assertIn('"--moe_resident_weight_limit_gb"', source)
         self.assertIn("default=0.0", source)
 
-    def test_qk_norm_weight_load_is_owned_by_qwen3_family_branch(self):
+    def test_qk_norm_weight_load_is_owned_by_qk_norm_family_branch(self):
         attention = next(
             node
             for node in self.tree.body
@@ -222,7 +222,7 @@ class MoEMainWiringStaticTest(unittest.TestCase):
             if isinstance(node, ast.If)
             and isinstance(node.test, ast.Call)
             and isinstance(node.test.func, ast.Name)
-            and node.test.func.id == "is_qwen3_family"
+            and node.test.func.id == "has_qk_norm"
         )
         branch_calls = [
             node
@@ -239,7 +239,7 @@ class MoEMainWiringStaticTest(unittest.TestCase):
             node.name: ast.unparse(node)
             for node in self.tree.body
             if isinstance(node, ast.ClassDef)
-            and node.name in {"MoEBlock", "Qwen3ResidentExpertProviderFactory"}
+            and node.name in {"MoEBlock", "RoutedMoeResidentExpertProviderFactory"}
         }
         protected_classes.update({
             node.name: ast.unparse(node)
@@ -248,7 +248,7 @@ class MoEMainWiringStaticTest(unittest.TestCase):
             and node.name in {"ExpertProvider", "ResidentExpertProvider"}
         })
         self.assertEqual(set(protected_classes), {
-            "MoEBlock", "Qwen3ResidentExpertProviderFactory",
+            "MoEBlock", "RoutedMoeResidentExpertProviderFactory",
             "ExpertProvider", "ResidentExpertProvider",
         })
         for source in protected_classes.values():
@@ -265,7 +265,7 @@ class MoEMainWiringStaticTest(unittest.TestCase):
         self.assertIn('"--expert_mode"', source)
         self.assertIn('choices=("resident", "demand")', source)
         self.assertIn('"--moe_expert_store"', source)
-        self.assertIn("Qwen3DemandExpertProviderFactory", source)
+        self.assertIn("RoutedMoeDemandExpertProviderFactory", source)
         self.assertNotIn("CacheManager", expert_source)
         self.assertNotIn("TorchDisk", expert_source)
         self.assertNotIn("general_copy", expert_source)
